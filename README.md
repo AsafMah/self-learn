@@ -75,6 +75,12 @@ have.
 - The proposal is **retained until an explicit decline or a successful write**. A confirm
   exception or a failed write keeps it for another attempt rather than destroying the draft;
   after 3 failed attempts it is discarded so it cannot re-prompt forever.
+- **The transcript is treated as untrusted input.** Instruction-shaped text inside it is not
+  authority. Tool arguments named `prompt` or `message` are redacted — for agent-spawning tools
+  (`task`, `write_agent`) their value is literally an instruction to another agent — and the
+  screener prompt states that only `USER:` lines carry the user's requirements. Not theoretical:
+  the companion `advisor` extension, which lacks this, issued a false `blocker` after reading a
+  prompt sent to a probe sub-agent as though it were a user requirement.
 
 **Topical relevance is not enforced in code.** Whether a lesson genuinely belongs in the skill
 being refined is a judgement, guided by the screener prompt and checked by the user at approval.
