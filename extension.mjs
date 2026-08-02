@@ -13,6 +13,7 @@ import {
     writeFileSync,
     mkdirSync,
     copyFileSync,
+    rmSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname, resolve, sep } from "node:path";
@@ -38,6 +39,13 @@ const DEFAULTS = {
 // Absorbs the lag between a sub-agent reporting idle and its reply appearing in the event log.
 const SETTLED_EMPTY_POLL_LIMIT = 8;
 const SCREENER_DESCRIPTION = "Self-learn screening";
+
+// A proposal outlives an extension reload, but not indefinitely: approving a draft whose
+// motivating work has scrolled out of memory is worse than losing it.
+const PENDING_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+
+// A retained proposal must not re-prompt forever if its write keeps failing.
+const MAX_PROPOSAL_ATTEMPTS = 3;
 
 function loadConfig(workingDirectory) {
     const candidates = [
@@ -66,6 +74,7 @@ const state = {
     screeningInFlight: false,
     reflecting: false,
     forcedReflection: false,
+    resolvingProposal: false,
     screenedTurns: 0,
     hits: 0,
     written: 0,
@@ -586,59 +595,167 @@ async function resolvePendingProposal(session) {
     const p = state.pendingProposal;
     if (!p || p.deferred) return false;
 
-    state.pendingProposal = null;
+    // The proposal is deliberately NOT cleared up front: a confirm exception, a reload during the
+    // dialog, or a failed write would otherwise destroy the draft, which is exactly what
+    // persisting it is meant to prevent. It is cleared only on an explicit decline, a successful
+    // write, or an outcome that can never succeed. An in-flight guard replaces early clearing as
+    // the re-entrancy protection.
+    if (state.resolvingProposal) return false;
+    state.resolvingProposal = true;
 
-    // Label from what is actually on disk, not from the declared mode, so a "new" proposal that
-    // collides with an existing skill is presented as the overwrite it really is.
-    let target;
-    try {
-        target = await resolveSkillFile(session, p.name, { mode: p.mode });
-    } catch (err) {
-        state.lastError = `path check failed: ${err?.message ?? err}`;
-        debug(state.lastError);
-        await session.log(`self-learn: rejected proposal — ${state.lastError}`, { level: "error" });
+    // Bounds any failure that would otherwise re-prompt on every yield.
+    p.attempts = (p.attempts ?? 0) + 1;
+    if (p.attempts > MAX_PROPOSAL_ATTEMPTS) {
+        state.pendingProposal = null;
+        persistPendingProposal(session);
+        state.resolvingProposal = false;
+        debug(`discarding proposal "${p.name}" after ${p.attempts - 1} failed attempts`);
+        await session.log(
+            `self-learn: giving up on proposal "${p.name}" after repeated failures — ${state.lastError ?? "unknown error"}`,
+            { level: "error" },
+        );
         return true;
     }
+    persistPendingProposal(session);
 
-    const exists = existsSync(target.file);
-    const where = exists ? `OVERWRITE the existing skill "${p.name}"` : `create new skill "${p.name}"`;
-    const disabledNote = p.targetDisabled
-        ? `\n\nNote: "${p.name}" is currently DISABLED in your settings, so this change will not \
+    const discard = (reason) => {
+        state.pendingProposal = null;
+        persistPendingProposal(session);
+        debug(`proposal "${p.name}" discarded: ${reason}`);
+    };
+
+    try {
+        // Label from what is actually on disk, not from the declared mode, so a "new" proposal
+        // that collides with an existing skill is presented as the overwrite it really is.
+        let target;
+        try {
+            target = await resolveSkillFile(session, p.name, { mode: p.mode });
+        } catch (err) {
+            // Unwritable by construction — retrying cannot help.
+            state.lastError = `path check failed: ${err?.message ?? err}`;
+            discard(state.lastError);
+            await session.log(`self-learn: rejected proposal — ${state.lastError}`, { level: "error" });
+            return true;
+        }
+
+        const exists = existsSync(target.file);
+        const where = exists ? `OVERWRITE the existing skill "${p.name}"` : `create new skill "${p.name}"`;
+        const disabledNote = p.targetDisabled
+            ? `\n\nNote: "${p.name}" is currently DISABLED in your settings, so this change will not \
 take effect until you re-enable it.`
-        : "";
-    const backupNote = exists ? "\nThe previous version is kept as SKILL.md.bak." : "";
-    // Surfaced because a refine of a skill installed elsewhere writes outside the personal
-    // skills directory, and a mistargeted refine would otherwise be invisible until too late.
-    const pathNote = `\n\nFile: ${target.file}`;
+            : "";
+        const backupNote = exists ? "\nThe previous version is kept as SKILL.md.bak." : "";
+        // Surfaced because a refine of a skill installed elsewhere writes outside the personal
+        // skills directory, and a mistargeted refine would otherwise be invisible until too late.
+        const pathNote = `\n\nFile: ${target.file}`;
 
-    const message = `self-learn wants to ${where}.\n\n${p.description}\n\n${truncate(p.body, 800)}\
+        const message = `self-learn wants to ${where}.\n\n${p.description}\n\n${truncate(p.body, 800)}\
 ${backupNote}${pathNote}${disabledNote}\n\nWrite it?`;
 
-    let approved = false;
-    try {
-        approved = await session.ui.confirm(message);
-    } catch (err) {
-        state.lastError = `confirm failed: ${err?.message ?? err}`;
-        debug(state.lastError);
-        return false;
-    }
+        let approved = false;
+        try {
+            approved = await session.ui.confirm(message);
+        } catch (err) {
+            // Kept for another attempt: the host may not have been ready to show a dialog.
+            state.lastError = `confirm failed: ${err?.message ?? err}`;
+            debug(`${state.lastError} — proposal "${p.name}" retained`);
+            return false;
+        }
 
-    if (!approved) {
-        debug(`proposal "${p.name}" declined by user`);
-        await session.log(`self-learn: discarded proposal for "${p.name}"`);
+        if (!approved) {
+            discard("declined by user");
+            await session.log(`self-learn: discarded proposal for "${p.name}"`);
+            return true;
+        }
+
+        try {
+            const file = await writeSkill(session, p);
+            discard("written");
+            state.written++;
+            await session.log(`self-learn: wrote ${file}`);
+        } catch (err) {
+            // Kept so a transient failure (locked file, transient FS error) can be retried.
+            state.lastError = `write failed: ${err?.message ?? err}`;
+            debug(`${state.lastError} — proposal "${p.name}" retained for retry`);
+            await session.log(
+                `self-learn: write failed, proposal kept — ${state.lastError}`,
+                { level: "error" },
+            );
+        }
         return true;
+    } finally {
+        state.resolvingProposal = false;
     }
+}
 
+// ---------------------------------------------------------------------------
+// Pending-proposal persistence
+//
+// Extensions are re-forked on reload and on /clear, and any in-memory state is lost. A proposal
+// captured before a reload would otherwise vanish between drafting and approval — likely here,
+// since a second session editing these files triggers reloads this session does not control.
+// ---------------------------------------------------------------------------
+
+function pendingProposalPath(session) {
+    const ws = session.workspacePath;
+    if (ws) return join(ws, "files", "self-learn-pending.json");
+    // Infinite sessions disabled: fall back to a per-session file so two sessions cannot
+    // clobber each other's proposals.
+    return join(homedir(), ".copilot", "self-learn", `pending-${session.sessionId}.json`);
+}
+
+function persistPendingProposal(session) {
+    const path = pendingProposalPath(session);
     try {
-        const file = await writeSkill(session, p);
-        state.written++;
-        await session.log(`self-learn: wrote ${file}`);
+        if (!state.pendingProposal) {
+            if (existsSync(path)) {
+                rmSync(path);
+                debug("cleared persisted proposal");
+            }
+            return;
+        }
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(
+            path,
+            JSON.stringify({ savedAt: Date.now(), proposal: state.pendingProposal }, null, 2),
+            "utf8",
+        );
+        debug(`persisted proposal "${state.pendingProposal.name}" to ${path}`);
     } catch (err) {
-        state.lastError = `write failed: ${err?.message ?? err}`;
-        debug(state.lastError);
-        await session.log(`self-learn: write failed — ${state.lastError}`, { level: "error" });
+        // Persistence is a convenience; losing it must never break the session.
+        debug(`failed to persist proposal: ${err?.message ?? err}`);
     }
-    return true;
+}
+
+function restorePendingProposal(session) {
+    const path = pendingProposalPath(session);
+    try {
+        if (!existsSync(path)) return;
+        const { savedAt, proposal } = JSON.parse(readFileSync(path, "utf8"));
+
+        const ageMs = Date.now() - (savedAt ?? 0);
+        if (ageMs > PENDING_MAX_AGE_MS) {
+            debug(`discarding stale persisted proposal (${Math.round(ageMs / 3600000)}h old)`);
+            rmSync(path);
+            return;
+        }
+
+        // Re-validate: the file is editable on disk and must not be trusted to still be sane.
+        const problem = validateProposal(proposal);
+        if (problem) {
+            debug(`discarding invalid persisted proposal: ${problem}`);
+            rmSync(path);
+            return;
+        }
+
+        state.pendingProposal = proposal;
+        debug(
+            `restored proposal "${proposal.name}" (age ${Math.round(ageMs / 1000)}s, ` +
+                `deferred=${proposal.deferred === true})`,
+        );
+    } catch (err) {
+        debug(`failed to restore proposal: ${err?.message ?? err}`);
+    }
 }
 
 const session = await joinSession({
@@ -682,6 +799,7 @@ const session = await joinSession({
                     if (!state.pendingProposal) return "No pending proposal.";
                     const name = state.pendingProposal.name;
                     state.pendingProposal = null;
+                    persistPendingProposal(session);
                     return `Discarded pending proposal "${name}".`;
                 }
 
@@ -806,6 +924,7 @@ const session = await joinSession({
                 proposal.deferred = !state.forcedReflection;
                 state.forcedReflection = false;
                 state.pendingProposal = proposal;
+                persistPendingProposal(session);
                 debug(`proposal captured: ${proposal.mode} "${proposal.name}" (deferred=${proposal.deferred})`);
 
                 return proposal.deferred
@@ -822,6 +941,7 @@ const session = await joinSession({
             // A held proposal becomes eligible once the user has taken their next turn.
             if (state.pendingProposal?.deferred) {
                 state.pendingProposal.deferred = false;
+                persistPendingProposal(session);
                 debug(`proposal "${state.pendingProposal.name}" is now eligible for approval`);
             }
         },
@@ -904,6 +1024,7 @@ const session = await joinSession({
                 }
                 const name = state.pendingProposal.name;
                 state.pendingProposal = null;
+                persistPendingProposal(session);
                 await session.log(`self-learn: discarded pending proposal "${name}"`);
             },
         },
@@ -955,6 +1076,9 @@ function dumpDeliveredTypes() {
     debug(`DELIVERED EVENT TYPES (${rows.length}): ${rows.map(([k, n]) => `${k}=${n}`).join(", ")}`);
 }
 
+// Recover a proposal captured before a reload, so drafting work is not silently lost.
+restorePendingProposal(session);
+
 // `session.idle` fires exactly once per yield to the user, and unlike `assistant.idle` it also
 // guarantees background work has settled — so the transcript is complete rather than mid-flight.
 session.on("session.idle", (event) => {
@@ -1003,6 +1127,9 @@ session.on("session.idle", (event) => {
 });
 
 await session.log(
-    `self-learn ready — screening with ${cfg("screenerModel")} after >=${cfg("minToolCalls")} tool calls`,
+    `self-learn ready — screening with ${cfg("screenerModel")} after >=${cfg("minToolCalls")} tool calls` +
+        (state.pendingProposal
+            ? `; restored pending proposal "${state.pendingProposal.name}"`
+            : ""),
     { ephemeral: true },
 );

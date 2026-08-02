@@ -59,6 +59,13 @@ type.
 - The user's hand-written `~/.copilot/copilot-instructions.md` is never touched.
 - Refining a skill that is **disabled** in settings is detected and surfaced in the approval
   dialog, since the write would otherwise silently have no effect.
+- A pending proposal **survives an extension reload**. It is written to the session workspace and
+  restored on load, because extensions are re-forked on reload and on `/clear` — and a second
+  session editing these files triggers reloads this session does not control. On restore it is
+  re-validated (the file is editable on disk) and discarded if older than 12 hours.
+- The proposal is **retained until an explicit decline or a successful write**. A confirm
+  exception or a failed write keeps it for another attempt rather than destroying the draft;
+  after 3 failed attempts it is discarded so it cannot re-prompt forever.
 
 **Topical relevance is not enforced in code.** Whether a lesson genuinely belongs in the skill
 being refined is a judgement, guided by the screener prompt and checked by the user at approval.
