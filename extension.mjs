@@ -189,6 +189,11 @@ Strongly prefer refining an existing skill over creating a new one. The user cur
 set tightly; near-duplicates are harmful. Most turns produce nothing. "false" is the correct \
 answer the large majority of the time.
 
+Choose "refine" ONLY when the lesson belongs to the SAME SUBJECT as that skill, such that a \
+reader of that skill would expect to find it there. If the lesson is merely adjacent — same \
+general area, different topic — choose "new" instead. Mistargeting a refine corrupts an unrelated \
+skill, which is worse than creating a new one.
+
 Respond with EXACTLY ONE JSON object and nothing else:
 {"worthLearning": true|false, "target": "new"|"refine", "skill": "...", "rationale": "..."}
 
@@ -467,14 +472,41 @@ function renderSkillFile(p) {
     return `---\nname: ${oneLine(p.name)}\ndescription: ${oneLine(p.description)}\n---\n\n${p.body.trim()}\n`;
 }
 
-// Resolves a skill's file path, enforcing that it stays inside the skills root.
-async function resolveSkillFile(session, name) {
+// Resolves a skill's file path, enforcing that writes stay inside the user's personal skills root.
+//
+// A refine must target the skill's ACTUAL location, since resolving every name against the
+// personal root would silently create a shadow copy competing with the real skill. But that
+// location is only writable if the user owns it: plugin and bundled skills live in caches and
+// install directories that updates overwrite, and are never ours to modify.
+async function resolveSkillFile(session, name, { mode = "new" } = {}) {
     const root = await resolveSkillsRoot(session);
+    const rootWithSep = root.endsWith(sep) ? root : root + sep;
+
+    if (mode === "refine") {
+        let existing;
+        try {
+            const { skills } = await session.rpc.skills.list();
+            existing = skills.find((s) => s.name === name && s.path);
+        } catch (err) {
+            debug(`skills.list failed while resolving "${name}": ${err?.message ?? err}`);
+        }
+
+        if (existing) {
+            const file = resolve(existing.path);
+            if (!file.startsWith(rootWithSep)) {
+                throw new Error(
+                    `"${name}" lives outside your personal skills directory (${file}). ` +
+                        `Refusing to modify a plugin or bundled skill.`,
+                );
+            }
+            return { dir: dirname(file), file };
+        }
+    }
+
     const dir = resolve(join(root, name));
 
     // Containment check: a crafted name must never escape the skills directory and reach, for
     // example, the user's hand-written copilot-instructions.md.
-    const rootWithSep = root.endsWith(sep) ? root : root + sep;
     if (!dir.startsWith(rootWithSep)) {
         throw new Error(`refusing to write outside skills root: ${dir}`);
     }
@@ -482,7 +514,7 @@ async function resolveSkillFile(session, name) {
 }
 
 async function writeSkill(session, p) {
-    const { dir, file } = await resolveSkillFile(session, p.name);
+    const { dir, file } = await resolveSkillFile(session, p.name, { mode: p.mode });
     const existed = existsSync(file);
 
     // Keyed on existence, not on the declared mode: a proposal claiming mode "new" whose name
@@ -558,9 +590,9 @@ async function resolvePendingProposal(session) {
 
     // Label from what is actually on disk, not from the declared mode, so a "new" proposal that
     // collides with an existing skill is presented as the overwrite it really is.
-    let exists = false;
+    let target;
     try {
-        exists = existsSync((await resolveSkillFile(session, p.name)).file);
+        target = await resolveSkillFile(session, p.name, { mode: p.mode });
     } catch (err) {
         state.lastError = `path check failed: ${err?.message ?? err}`;
         debug(state.lastError);
@@ -568,15 +600,19 @@ async function resolvePendingProposal(session) {
         return true;
     }
 
+    const exists = existsSync(target.file);
     const where = exists ? `OVERWRITE the existing skill "${p.name}"` : `create new skill "${p.name}"`;
     const disabledNote = p.targetDisabled
         ? `\n\nNote: "${p.name}" is currently DISABLED in your settings, so this change will not \
 take effect until you re-enable it.`
         : "";
     const backupNote = exists ? "\nThe previous version is kept as SKILL.md.bak." : "";
+    // Surfaced because a refine of a skill installed elsewhere writes outside the personal
+    // skills directory, and a mistargeted refine would otherwise be invisible until too late.
+    const pathNote = `\n\nFile: ${target.file}`;
 
     const message = `self-learn wants to ${where}.\n\n${p.description}\n\n${truncate(p.body, 800)}\
-${backupNote}${disabledNote}\n\nWrite it?`;
+${backupNote}${pathNote}${disabledNote}\n\nWrite it?`;
 
     let approved = false;
     try {
@@ -607,6 +643,67 @@ ${backupNote}${disabledNote}\n\nWrite it?`;
 
 const session = await joinSession({
     tools: [
+        {
+            name: "self_learn_now",
+            description:
+                "Run a self-learn review of recent work now. Screens recent activity for a " +
+                "durable, reusable lesson and, if it finds one, asks you to draft it as a skill " +
+                "for the user to approve. Use when the user asks to run self-learn, capture a " +
+                "lesson, or check whether anything is worth learning. Also reports status.",
+            parameters: {
+                type: "object",
+                properties: {
+                    action: {
+                        type: "string",
+                        enum: ["review", "status", "discard"],
+                        description:
+                            "review: screen and escalate on a hit. status: counters and pending " +
+                            "state. discard: drop the pending proposal without writing it.",
+                    },
+                },
+                required: [],
+            },
+            skipPermission: true,
+            handler: async (args) => {
+                const action = args?.action ?? "review";
+
+                if (action === "status") {
+                    const p = state.pendingProposal;
+                    return [
+                        `enabled: ${cfg("enabled")}, write: ${cfg("write")}`,
+                        `screener: ${cfg("screenerModel")} (${cfg("agentType")})`,
+                        `turns screened: ${state.screenedTurns}, hits: ${state.hits}, written: ${state.written}`,
+                        `pending: ${p ? `${p.mode} "${p.name}"${p.deferred ? " (held)" : " (awaiting approval)"}` : "none"}`,
+                        `last error: ${state.lastError ?? "none"}`,
+                    ].join("\n");
+                }
+
+                if (action === "discard") {
+                    if (!state.pendingProposal) return "No pending proposal.";
+                    const name = state.pendingProposal.name;
+                    state.pendingProposal = null;
+                    return `Discarded pending proposal "${name}".`;
+                }
+
+                if (state.pendingProposal) {
+                    return `A proposal for "${state.pendingProposal.name}" is already awaiting approval.`;
+                }
+
+                const verdict = await screen(session, { force: true, lookback: 600 });
+                if (verdict?.error) return `Screening failed: ${verdict.error}`;
+                if (!verdict?.worthLearning) {
+                    return `Nothing worth learning${verdict?.skipped ? ` (${verdict.skipped})` : ""}. Report this to the user and stop.`;
+                }
+                if (!cfg("write")) return "A lesson was found, but writing is disabled in config.";
+
+                // Escalation normally happens in the idle handler; on-demand review escalates
+                // here so a forced run can actually lead to a write.
+                state.reflecting = true;
+                state.forcedReflection = true;
+                debug(`on-demand escalation: ${verdict.target} "${verdict.skill}"`);
+                return buildReflectionNudge(verdict);
+            },
+        },
         {
             name: "propose_skill",
             description:
@@ -665,14 +762,44 @@ const session = await joinSession({
                     return { textResultForLlm: `Proposal rejected: ${problem}`, resultType: "failure" };
                 }
 
-                // Refining a disabled skill would silently have no effect; surface it at approval.
+                // A refine must name a skill that actually exists. Otherwise "refine" silently
+                // degrades into creating a new skill under a name the user may not expect.
+                let existing;
                 try {
                     const { skills } = await session.rpc.skills.list();
-                    const existing = skills.find((s) => s.name === proposal.name);
-                    proposal.targetDisabled = existing ? existing.enabled === false : false;
+                    existing = skills.find((s) => s.name === proposal.name);
                 } catch {
-                    proposal.targetDisabled = false;
+                    existing = undefined;
                 }
+
+                if (proposal.mode === "refine" && !existing) {
+                    debug(`rejected refine of unknown skill "${proposal.name}"`);
+                    return {
+                        textResultForLlm:
+                            `No skill named "${proposal.name}" exists, so it cannot be refined. ` +
+                            `Either use mode "new" with a name that reflects the lesson's own ` +
+                            `subject, or decline if the lesson belongs in an existing skill you ` +
+                            `have not named correctly.`,
+                        resultType: "failure",
+                    };
+                }
+
+                // Fail here rather than at approval, so the agent can still choose a new name.
+                try {
+                    await resolveSkillFile(session, proposal.name, { mode: proposal.mode });
+                } catch (err) {
+                    const reason = err?.message ?? String(err);
+                    debug(`rejected proposal: ${reason}`);
+                    return {
+                        textResultForLlm:
+                            `${reason} Propose a new personal skill instead, named for the ` +
+                            `lesson's own subject.`,
+                        resultType: "failure",
+                    };
+                }
+
+                // Refining a disabled skill would silently have no effect; surface it at approval.
+                proposal.targetDisabled = existing ? existing.enabled === false : false;
 
                 // Held until after the user's next turn so the dialog never lands on the moment
                 // they regain the keyboard — unless the user forced this reflection themselves.
@@ -681,7 +808,9 @@ const session = await joinSession({
                 state.pendingProposal = proposal;
                 debug(`proposal captured: ${proposal.mode} "${proposal.name}" (deferred=${proposal.deferred})`);
 
-                return `Recorded. The user will be asked to approve "${proposal.name}" after your next turn.`;
+                return proposal.deferred
+                    ? `Recorded. The user will be asked to approve "${proposal.name}" after their next turn.`
+                    : `Recorded. The user will be asked to approve "${proposal.name}" at the end of this turn.`;
             },
         },
     ],

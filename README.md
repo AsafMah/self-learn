@@ -40,15 +40,31 @@ type.
 
 - The agent **cannot write skills itself** — it submits a draft through `propose_skill`, and the
   extension writes only after explicit approval.
+- **Writes never leave the personal skills root.** New skills are created under it; a `refine`
+  resolves the target's actual path from `rpc.skills.list()` and is **rejected** if that path
+  lies outside the root. Plugin and bundled skills live in caches and install directories that
+  updates overwrite, and are never modified. Resolving a refine against the personal root instead
+  would silently create a shadow copy competing with the real skill, so neither shortcut is safe.
 - Skill names must match `^[a-z0-9][a-z0-9-]{0,63}$`, which rejects `../`, `..\`, `/`, and `.`;
-  the resolved directory is additionally checked to be inside the skills root.
+  the resolved directory is additionally checked to be inside the root.
+- A `refine` naming a skill that does not exist is rejected, rather than silently degrading into
+  creating a new skill under an unexpected name. Both this and the containment check run at
+  submission time, so the agent can pick a different name rather than failing at approval.
 - Frontmatter values are collapsed to a single line, so a crafted name or description cannot
   inject extra YAML keys or terminate the block.
-- `mode: refine` copies the previous file to `SKILL.md.bak` before overwriting.
-- The user's hand-written `~/.copilot/copilot-instructions.md` is never touched; it is outside the
-  skills root and unreachable by construction.
+- Any existing `SKILL.md` is copied to `SKILL.md.bak` before being replaced — keyed on the file
+  existing, not on the declared mode, so a `new` proposal colliding with an existing skill is
+  still recoverable and is labelled as an overwrite.
+- The approval dialog shows the exact file to be written.
+- The user's hand-written `~/.copilot/copilot-instructions.md` is never touched.
 - Refining a skill that is **disabled** in settings is detected and surfaced in the approval
   dialog, since the write would otherwise silently have no effect.
+
+**Topical relevance is not enforced in code.** Whether a lesson genuinely belongs in the skill
+being refined is a judgement, guided by the screener prompt and checked by the user at approval.
+The code enforces only existence, containment, and format. A screener can and does mistarget:
+in testing it proposed filing a lesson about extension command surfaces into an unrelated
+canvas-authoring skill.
 
 
 ## Install
@@ -82,12 +98,25 @@ First match wins: `$COPILOT_SELF_LEARN_CONFIG`, `<cwd>/.github/self-learn.json`,
 | `debugLog` | `~/.copilot/logs/self-learn.log` | Trace file. `null` disables. |
 | `instructions` | `""` | Extra project-specific screening instructions. |
 
-## Commands
+## Commands and tools
+
+Extension slash commands only surface in the CLI's TUI. **The GitHub Copilot app does not show
+them**, so the same functionality is also exposed as a tool the agent can call, which works on
+both surfaces.
+
+| Tool | Purpose |
+| --- | --- |
+| `self_learn_now` (`action: "review"`) | Screen recent activity now; escalate on a hit. |
+| `self_learn_now` (`action: "status"`) | Counters and pending-proposal state. |
+| `self_learn_now` (`action: "discard"`) | Drop the pending proposal without writing it. |
+| `propose_skill` | Used by the agent to submit a draft. Rejected outside a reflection. |
+
+In the CLI TUI these are also available as slash commands:
 
 | Command | Purpose |
 | --- | --- |
 | `/learn` | Status: cadence, turns screened, hits, writes, pending proposal. |
-| `/learn-now` | Force a screening of recent activity. |
+| `/learn-now` | Screen recent activity, and escalate if there is something to learn. |
 | `/learn-discard` | Drop the pending proposal without writing it. |
 | `/learn-events` | Dump which event types are actually delivered to extensions. |
 | `/learn-on` / `/learn-off` | Toggle for this session. |
@@ -141,3 +170,5 @@ guessing.
   model's default effort.
 - Every screening emits an "agent finished" system notification into the main agent's context.
 - The extension loads per session, so several sessions screen independently.
+- **Extension slash commands do not appear in the GitHub Copilot app**, only in the CLI's TUI.
+  The `self_learn_now` tool exists to cover that gap.
