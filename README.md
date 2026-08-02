@@ -45,6 +45,31 @@ The hybrid split exists because screening is cheap and almost always negative, w
 good skill needs the main agent's own reasoning — which a sub-agent reading a transcript does not
 have.
 
+## The rubric
+
+The screener does **not** return a verdict. It answers five criteria independently, and the
+extension computes the outcome — so it cannot reach "worth learning" by asserting a conclusion.
+
+| Criterion | Test |
+| --- | --- |
+| `surprising` | Contradicts what a competent engineer would have assumed. |
+| `expensive` | Not knowing it demonstrably cost something in this transcript. |
+| `undiscoverable` | Could not have been found in the obvious docs or type definitions. |
+| `transferable` | Applies to a future session on a different task. |
+| `uncovered` | No existing skill already addresses the subject. |
+
+All five must pass. `expensive` additionally requires a **verbatim quote from the transcript**,
+at least 24 characters, which the extension checks against the transcript it actually sent. An
+invented or paraphrased quote is rejected — that turns "trust me, it cost something" into a
+mechanically checkable fact, and it is the criterion that separates real lessons from
+plausible-sounding observations.
+
+Anything malformed — a missing criterion, a non-boolean `pass`, no JSON at all — rejects. Failing
+safe here is cheap: rejection means no skill, and the review can simply be run again.
+
+Rejections report which criteria failed, e.g. `failed: surprising, expensive, undiscoverable,
+uncovered`, which is what makes the bar tunable rather than mysterious.
+
 ## Safety
 
 - The agent **cannot write skills itself** — it submits a draft through `propose_skill`, and the
