@@ -5,6 +5,7 @@
     "minToolCalls": 5,
     "write": true,
     "autoScreen": false,
+    "screenOnTaskComplete": true,
     "skillsRoot": null,
     "maxSkillBytes": 65536,
     "maxTranscriptChars": 24000,

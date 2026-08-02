@@ -11,6 +11,11 @@ The review runs **on request**, not on a timer: either the user asks, or the age
 `self_learn_now` when it judges a substantive piece of work finished. Screening every yield was
 tried first and was too aggressive — most yields are mid-conversation, not task boundaries.
 
+It also reviews automatically when the agent calls the built-in `task_complete` tool, which emits
+`session.task_complete`. That is the agent's own declaration that a task is done, and so the most
+precise trigger available. The tool is not enabled in every mode, so this may never fire; when it
+does not, nothing is lost. Disable with `screenOnTaskComplete: false`.
+
 ```
 review requested  (user asks, or the agent calls self_learn_now at task completion)
       ▼
@@ -98,6 +103,7 @@ First match wins: `$COPILOT_SELF_LEARN_CONFIG`, `<cwd>/.github/self-learn.json`,
 | `enabled` | `true` | Master switch. |
 | `write` | `true` | When false, screen and log only — never escalate or write. |
 | `autoScreen` | `false` | Also review automatically at every qualifying yield. Off by default. |
+| `screenOnTaskComplete` | `true` | Review when the agent calls the built-in `task_complete` tool. |
 | `minToolCalls` | `5` | Only used when `autoScreen` is on. |
 | `skillsRoot` | `null` | Skills directory. `null` derives it from the runtime's own skill paths. |
 | `maxSkillBytes` | `65536` | Rejects oversized drafts. |
@@ -138,6 +144,13 @@ In the CLI TUI these are also available as slash commands:
 ## Runtime findings
 
 These were established empirically and are why the code looks the way it does.
+
+**`session.task_complete` comes from a built-in tool, not from sub-agents.** `task_complete`
+appears in the SDK's `BuiltInTools.Isolated` list alongside `ask_user`, `exit_plan_mode` and
+`task`; the event is emitted when the agent calls it. Measured: a full RPC-started sub-agent
+lifecycle and a `task`-tool sub-agent both completed without emitting it, across a 42-type
+delivered-event tally. It is therefore a genuine "the agent declares itself done" signal, but only
+in modes where that tool is enabled.
 
 **`session.idle` is the only correct yield signal.** Measured over one turn: `session.idle` = 1,
 `assistant.idle [MAIN]` = 1, `assistant.turn_end [MAIN]` = 10. `turn_end` fires per agentic

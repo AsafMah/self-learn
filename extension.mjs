@@ -25,6 +25,10 @@ const DEFAULTS = {
     // boundaries. By default the review runs only when asked — by the user, or by the agent
     // when it judges a substantive piece of work finished.
     autoScreen: false,
+    // `session.task_complete` fires when the agent calls the built-in `task_complete` tool to
+    // declare a task finished — the most precise "it considers itself done" signal available.
+    // The tool is not enabled in every mode, so this costs nothing when it never fires.
+    screenOnTaskComplete: true,
     screenerModel: "gpt-5.6-terra",
     agentType: "rubber-duck",
     minToolCalls: 5,
@@ -1093,6 +1097,25 @@ function dumpDeliveredTypes() {
 
 // Recover a proposal captured before a reload, so drafting work is not silently lost.
 restorePendingProposal(session);
+
+// Emitted when the agent calls the built-in `task_complete` tool to declare a task finished.
+// This is the agent's own judgement that it is done, which is a far better review trigger than
+// yielding — most yields are mid-conversation. The tool is not enabled in every mode, so this
+// listener may simply never fire.
+session.on("session.task_complete", (event) => {
+    const d = event?.data ?? {};
+    debug(`session.task_complete (success=${d.success}, summary=${truncate(d.summary ?? "", 200)})`);
+
+    if (!cfg("enabled") || !cfg("screenOnTaskComplete")) return;
+    // A task the agent reports as failed has no lesson worth trusting yet.
+    if (d.success === false) return;
+    if (state.reflecting || state.pendingProposal || state.screeningInFlight) return;
+
+    void (async () => {
+        const verdict = await screen(session, { force: true, lookback: 600 });
+        if (verdict?.worthLearning && cfg("write")) escalate(session, verdict);
+    })().catch((err) => debug(`task_complete screening threw: ${err?.message ?? err}`));
+});
 
 // `session.idle` fires exactly once per yield to the user, and unlike `assistant.idle` it also
 // guarantees background work has settled — so the transcript is complete rather than mid-flight.
