@@ -447,6 +447,18 @@ const session = await joinSession({
             },
         },
         {
+            name: "learn-events",
+            description: "Dump which session event types are actually delivered to extensions",
+            handler: async () => {
+                dumpDeliveredTypes();
+                const rows = [...deliveredTypes.entries()].sort((a, b) => b[1] - a[1]);
+                await session.log(
+                    `delivered event types (${rows.length}):\n` +
+                        rows.map(([k, n]) => `  ${k} = ${n}`).join("\n"),
+                );
+            },
+        },
+        {
             name: "learn-off",
             description: "Disable self-learn for this session",
             handler: async () => {
@@ -468,6 +480,30 @@ const session = await joinSession({
 function countToolCall(toolName) {
     if (typeof toolName === "string" && toolName.startsWith("learn")) return;
     state.toolCallsThisTurn++;
+}
+
+// `assistant.usage` reports the effort actually used for each model call. Sub-agent usage is
+// tagged with an agentId, which makes it possible to verify empirically whether
+// `subagents.agents[<type>].effortLevel` reaches an agent started over RPC — the open question
+// behind "the advisor's reasoning effort cannot be pinned".
+// Diagnostic: tally every event type actually delivered to an extension subscriber. Verifies the
+// instrument before any conclusion is drawn from a specific event's absence.
+const deliveredTypes = new Map();
+session.on((event) => {
+    const key = `${event?.type}${event?.agentId ? "@sub" : ""}`;
+    deliveredTypes.set(key, (deliveredTypes.get(key) ?? 0) + 1);
+    if (event?.type === "assistant.usage") {
+        const d = event?.data ?? {};
+        debug(
+            `USAGE [${event?.agentId ?? "MAIN"}] model=${d.model ?? "?"} ` +
+                `effort=${d.reasoningEffort ?? "ABSENT"} reasoningTokens=${d.reasoningTokens ?? "?"}`,
+        );
+    }
+});
+
+function dumpDeliveredTypes() {
+    const rows = [...deliveredTypes.entries()].sort((a, b) => b[1] - a[1]);
+    debug(`DELIVERED EVENT TYPES (${rows.length}): ${rows.map(([k, n]) => `${k}=${n}`).join(", ")}`);
 }
 
 // `session.idle` fires exactly once per yield to the user, and unlike `assistant.idle` it also
