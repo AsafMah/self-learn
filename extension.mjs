@@ -65,6 +65,7 @@ const state = {
     lastEventIndex: 0,
     screeningInFlight: false,
     reflecting: false,
+    forcedReflection: false,
     screenedTurns: 0,
     hits: 0,
     written: 0,
@@ -110,7 +111,7 @@ function renderEvent(event) {
     }
 }
 
-async function buildTranscriptDelta(session) {
+async function buildTranscriptDelta(session, { lookback = 0 } = {}) {
     let events = [];
     try {
         events = await session.getEvents();
@@ -120,8 +121,12 @@ async function buildTranscriptDelta(session) {
         return null;
     }
 
+    // A forced screening looks back over a window instead of only since the last screening,
+    // which would otherwise be empty or trivially thin when invoked on demand.
+    const from = lookback > 0 ? Math.max(0, events.length - lookback) : state.lastEventIndex;
+
     // Only main-agent activity; sub-agent chatter is noise for this purpose.
-    const delta = events.slice(state.lastEventIndex).filter((e) => !e?.agentId);
+    const delta = events.slice(from).filter((e) => !e?.agentId);
     state.lastEventIndex = events.length;
 
     const lines = delta.map(renderEvent).filter(Boolean);
@@ -355,7 +360,7 @@ async function disposeTask(rpc, agentId) {
     }
 }
 
-async function screen(session, { force = false } = {}) {
+async function screen(session, { force = false, lookback = 0 } = {}) {
     // Every early return logs: an unlogged exit is indistinguishable from the trigger never
     // firing, which has already caused one wrong diagnosis.
     if (state.screeningInFlight) {
@@ -379,7 +384,7 @@ async function screen(session, { force = false } = {}) {
 
     state.screeningInFlight = true;
     try {
-        const transcript = await buildTranscriptDelta(session);
+        const transcript = await buildTranscriptDelta(session, { lookback });
         if (!transcript) {
             debug(`skip: no new main-agent activity (lastEventIndex=${state.lastEventIndex})`);
             return { skipped: "no new activity" };
@@ -522,13 +527,16 @@ If on reflection there is no genuinely durable lesson here, call \`propose_skill
 \`decline: true\` and a brief reason instead.`;
 }
 
-function escalate(session, verdict) {
+function escalate(session, verdict, { forced = false } = {}) {
     if (state.pendingProposal) {
         debug("escalation skipped: a proposal is already pending");
         return;
     }
     state.reflecting = true;
-    debug(`escalating to main agent: ${verdict.target} "${verdict.skill}"`);
+    // An explicitly forced reflection confirms at the end of that same turn: the user just asked
+    // for it, so the dialog cannot be colliding with a reply they were composing.
+    state.forcedReflection = forced;
+    debug(`escalating to main agent: ${verdict.target} "${verdict.skill}" (forced=${forced})`);
 
     // Deferred: sending from inside an event handler risks re-entering the agent loop.
     setTimeout(() => {
@@ -667,10 +675,11 @@ const session = await joinSession({
                 }
 
                 // Held until after the user's next turn so the dialog never lands on the moment
-                // they regain the keyboard.
-                proposal.deferred = true;
+                // they regain the keyboard — unless the user forced this reflection themselves.
+                proposal.deferred = !state.forcedReflection;
+                state.forcedReflection = false;
                 state.pendingProposal = proposal;
-                debug(`proposal captured: ${proposal.mode} "${proposal.name}" (deferred)`);
+                debug(`proposal captured: ${proposal.mode} "${proposal.name}" (deferred=${proposal.deferred})`);
 
                 return `Recorded. The user will be asked to approve "${proposal.name}" after your next turn.`;
             },
@@ -717,10 +726,31 @@ const session = await joinSession({
         },
         {
             name: "learn-now",
-            description: "Force a self-learn screening of recent activity",
+            description: "Screen recent activity now, and escalate if there is something to learn",
             handler: async () => {
-                await session.log("self-learn: screening…", { ephemeral: true });
-                await screen(session, { force: true });
+                await session.log("self-learn: screening recent activity…", { ephemeral: true });
+                const verdict = await screen(session, { force: true, lookback: 600 });
+
+                if (verdict?.error) {
+                    await session.log(`self-learn: ${verdict.error}`, { level: "error" });
+                    return;
+                }
+                if (!verdict?.worthLearning) {
+                    await session.log(
+                        `self-learn: nothing worth learning${verdict?.skipped ? ` (${verdict.skipped})` : ""}`,
+                    );
+                    return;
+                }
+                if (!cfg("write")) {
+                    await session.log("self-learn: write is disabled; not escalating");
+                    return;
+                }
+                // Forced screening escalates too; otherwise a forced run could never lead to a
+                // write, since escalation normally happens only in the idle handler.
+                await session.log(
+                    `self-learn: drafting ${verdict.target} "${verdict.skill}" — you will be asked to approve it`,
+                );
+                escalate(session, verdict, { forced: true });
             },
         },
         {
@@ -815,6 +845,7 @@ session.on("session.idle", (event) => {
         // suppressing all further screening for the rest of the session.
         if (state.reflecting) {
             state.reflecting = false;
+            state.forcedReflection = false;
             state.toolCallsThisTurn = 0;
             debug(
                 state.pendingProposal
