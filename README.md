@@ -108,9 +108,11 @@ guessing.
 ## Known limitations
 
 - **Contention with `advisor`.** `session.idle` is deferred while background work is pending. An
-  advisor running at a low cadence spawns sub-agents near-continuously, which can defer idle past
-  the point where the user replies — starving this extension's trigger. Under investigation; keep
-  the advisor's `everyNToolCalls` reasonably high when running both.
+  advisor running at a low cadence spawns sub-agents near-continuously, which could in principle
+  defer idle past the point where the user replies, starving this extension's trigger. This is
+  **hypothesised, not demonstrated** — an earlier empty log was misread as evidence for it when
+  the build in question simply had no instrumentation on the idle path. Every early return now
+  logs, so the next empty log will be meaningful.
 - Stage 2 escalation calls `session.send`, which starts a **visible agent turn the user did not
   ask for**. Deferring the approval dialog does not hide that.
 - `startAgent` accepts a `model` but no reasoning-effort override, so the screener runs at its

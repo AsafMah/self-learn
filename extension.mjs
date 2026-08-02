@@ -103,6 +103,7 @@ async function buildTranscriptDelta(session) {
         events = await session.getEvents();
     } catch (err) {
         state.lastError = `getEvents failed: ${err?.message ?? err}`;
+        debug(`transcript: ${state.lastError}`);
         return null;
     }
 
@@ -342,13 +343,21 @@ async function disposeTask(rpc, agentId) {
 }
 
 async function screen(session, { force = false } = {}) {
-    if (state.screeningInFlight) return { skipped: "already screening" };
+    // Every early return logs: an unlogged exit is indistinguishable from the trigger never
+    // firing, which has already caused one wrong diagnosis.
+    if (state.screeningInFlight) {
+        debug("skip: a screening is already in flight");
+        return { skipped: "already screening" };
+    }
 
     const toolCalls = state.toolCallsThisTurn;
     state.toolCallsThisTurn = 0;
 
     if (!force) {
-        if (!cfg("enabled")) return { skipped: "disabled" };
+        if (!cfg("enabled")) {
+            debug("skip: disabled");
+            return { skipped: "disabled" };
+        }
         if (toolCalls < cfg("minToolCalls")) {
             debug(`skip: ${toolCalls} tool calls < ${cfg("minToolCalls")}`);
             return { skipped: "too few tool calls" };
@@ -358,7 +367,10 @@ async function screen(session, { force = false } = {}) {
     state.screeningInFlight = true;
     try {
         const transcript = await buildTranscriptDelta(session);
-        if (!transcript) return { skipped: "no new activity" };
+        if (!transcript) {
+            debug(`skip: no new main-agent activity (lastEventIndex=${state.lastEventIndex})`);
+            return { skipped: "no new activity" };
+        }
 
         const skills = await listSkills(session);
         state.screenedTurns++;
