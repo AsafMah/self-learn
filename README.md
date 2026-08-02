@@ -5,9 +5,6 @@ Reflects at every yield to the user and proposes durable lessons as skills.
 Inspired by oh-my-pi's auto-learn controller, reimplemented as a GitHub Copilot CLI extension.
 Companion to [`advisor`](../advisor).
 
-> **Status: phase 2 — screening only.** Verdicts are logged and surfaced in the timeline.
-> Nothing is written to disk yet. Escalation and approval are not implemented.
-
 ## How it works
 
 ```
@@ -21,18 +18,38 @@ STAGE 1 — screener sub-agent (cheap model, own context)
       ├─ false ──► done. The common case.
       │
       ▼
-STAGE 2 — escalate to the main agent            [NOT IMPLEMENTED]
-  session.send(nudge) so it drafts the skill with full context of its own reasoning
+STAGE 2 — escalate to the main agent
+  session.send(nudge) so it drafts the skill with full context of its own reasoning,
+  then submits it by calling the `propose_skill` tool. The agent never writes the file.
       │
       ▼
-STAGE 3 — deferred approval                     [NOT IMPLEMENTED]
-  hold the proposal, confirm at the NEXT yield so the dialog never collides with
-  the reply the user was about to type, then write SKILL.md + rpc.skills.reload()
+STAGE 3 — deferred approval
+  the proposal is HELD until the user has taken another turn, then confirmed via
+  session.ui.confirm() at the following yield, and only then written + skills.reload()
 ```
 
 The hybrid split exists because screening is cheap and almost always negative, while drafting a
 good skill needs the main agent's own reasoning — which a sub-agent reading a transcript does not
 have.
+
+Approval is deferred by one user turn on purpose: `session.idle` fires exactly as the user regains
+the keyboard, so confirming there would land the dialog on top of the reply they were about to
+type.
+
+## Safety
+
+- The agent **cannot write skills itself** — it submits a draft through `propose_skill`, and the
+  extension writes only after explicit approval.
+- Skill names must match `^[a-z0-9][a-z0-9-]{0,63}$`, which rejects `../`, `..\`, `/`, and `.`;
+  the resolved directory is additionally checked to be inside the skills root.
+- Frontmatter values are collapsed to a single line, so a crafted name or description cannot
+  inject extra YAML keys or terminate the block.
+- `mode: refine` copies the previous file to `SKILL.md.bak` before overwriting.
+- The user's hand-written `~/.copilot/copilot-instructions.md` is never touched; it is outside the
+  skills root and unreachable by construction.
+- Refining a skill that is **disabled** in settings is detected and surfaced in the approval
+  dialog, since the write would otherwise silently have no effect.
+
 
 ## Install
 
@@ -52,6 +69,9 @@ First match wins: `$COPILOT_SELF_LEARN_CONFIG`, `<cwd>/.github/self-learn.json`,
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `true` | Master switch. |
+| `write` | `true` | When false, screen and log only — never escalate or write. |
+| `skillsRoot` | `null` | Skills directory. `null` derives it from the runtime's own skill paths. |
+| `maxSkillBytes` | `65536` | Rejects oversized drafts. |
 | `screenerModel` | `gpt-5.6-terra` | Model for stage 1. Should differ from other extensions' models — see below. |
 | `agentType` | `rubber-duck` | Built-in agent type. Only `explore`, `task`, `general-purpose`, `rubber-duck`, `code-review`, `research`, `security-review` are dispatchable. |
 | `minToolCalls` | `5` | Turns with fewer tool calls are not worth screening. |
@@ -66,8 +86,10 @@ First match wins: `$COPILOT_SELF_LEARN_CONFIG`, `<cwd>/.github/self-learn.json`,
 
 | Command | Purpose |
 | --- | --- |
-| `/learn` | Status: cadence, turns screened, hits, last verdict. |
+| `/learn` | Status: cadence, turns screened, hits, writes, pending proposal. |
 | `/learn-now` | Force a screening of recent activity. |
+| `/learn-discard` | Drop the pending proposal without writing it. |
+| `/learn-events` | Dump which event types are actually delivered to extensions. |
 | `/learn-on` / `/learn-off` | Toggle for this session. |
 
 ## Runtime findings

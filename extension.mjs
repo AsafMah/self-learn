@@ -6,15 +6,26 @@
 // Companion to the `advisor` extension. See README.md.
 
 import { joinSession } from "@github/copilot-sdk/extension";
-import { readFileSync, existsSync, appendFileSync } from "node:fs";
+import {
+    readFileSync,
+    existsSync,
+    appendFileSync,
+    writeFileSync,
+    mkdirSync,
+    copyFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, dirname, resolve, sep } from "node:path";
 
 const DEFAULTS = {
     enabled: true,
+    write: true,
     screenerModel: "gpt-5.6-terra",
     agentType: "rubber-duck",
     minToolCalls: 5,
+    // null = derive from the runtime's own skill paths rather than hardcoding a location.
+    skillsRoot: null,
+    maxSkillBytes: 65536,
     maxTranscriptChars: 24000,
     maxToolResultChars: 1200,
     timeoutMs: 180000,
@@ -56,8 +67,10 @@ const state = {
     reflecting: false,
     screenedTurns: 0,
     hits: 0,
+    written: 0,
     lastVerdict: null,
     lastError: null,
+    pendingProposal: null,
     sessionOverrides: {},
 };
 
@@ -407,11 +420,272 @@ async function screen(session, { force = false } = {}) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stage 2/3: escalation, approval, and writing
+// ---------------------------------------------------------------------------
+
+const SKILL_NAME_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
+// Derive the skills directory from the runtime's own reported paths rather than hardcoding it,
+// falling back to the documented personal location.
+async function resolveSkillsRoot(session) {
+    const configured = cfg("skillsRoot");
+    if (configured) return resolve(configured);
+
+    try {
+        const { skills } = await session.rpc.skills.list();
+        const sample = skills.find((s) => s.path && s.source !== "plugin");
+        if (sample) return resolve(dirname(dirname(sample.path)));
+    } catch {
+        // Fall through to the default.
+    }
+    return join(homedir(), ".agents", "skills");
+}
+
+function validateProposal(p) {
+    if (!p || typeof p !== "object") return "proposal missing";
+    if (!SKILL_NAME_RE.test(p.name ?? "")) {
+        return `invalid skill name "${p.name}" (expected kebab-case, <=64 chars)`;
+    }
+    if (!p.description || typeof p.description !== "string") return "description required";
+    if (!p.body || typeof p.body !== "string") return "body required";
+    if (Buffer.byteLength(p.body, "utf8") > cfg("maxSkillBytes")) {
+        return `body exceeds maxSkillBytes (${cfg("maxSkillBytes")})`;
+    }
+    if (p.mode !== "new" && p.mode !== "refine") return `invalid mode "${p.mode}"`;
+    return null;
+}
+
+function renderSkillFile(p) {
+    // Frontmatter values are single-line; strip anything that could break out of them.
+    const oneLine = (s) => s.replace(/\r?\n/g, " ").replace(/"/g, "'").trim();
+    return `---\nname: ${oneLine(p.name)}\ndescription: ${oneLine(p.description)}\n---\n\n${p.body.trim()}\n`;
+}
+
+// Resolves a skill's file path, enforcing that it stays inside the skills root.
+async function resolveSkillFile(session, name) {
+    const root = await resolveSkillsRoot(session);
+    const dir = resolve(join(root, name));
+
+    // Containment check: a crafted name must never escape the skills directory and reach, for
+    // example, the user's hand-written copilot-instructions.md.
+    const rootWithSep = root.endsWith(sep) ? root : root + sep;
+    if (!dir.startsWith(rootWithSep)) {
+        throw new Error(`refusing to write outside skills root: ${dir}`);
+    }
+    return { dir, file: join(dir, "SKILL.md") };
+}
+
+async function writeSkill(session, p) {
+    const { dir, file } = await resolveSkillFile(session, p.name);
+    const existed = existsSync(file);
+
+    // Keyed on existence, not on the declared mode: a proposal claiming mode "new" whose name
+    // collides with an existing skill would otherwise destroy a hand-written file with no backup.
+    if (existed) {
+        copyFileSync(file, `${file}.bak`);
+        debug(`backed up ${file} -> ${file}.bak`);
+    }
+
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(file, renderSkillFile(p), "utf8");
+    debug(`wrote ${file} (mode=${p.mode}, existed=${existed})`);
+
+    try {
+        await session.rpc.skills.reload();
+    } catch (err) {
+        debug(`skills.reload failed: ${err?.message ?? err}`);
+    }
+    return file;
+}
+
+function buildReflectionNudge(verdict) {
+    const target =
+        verdict.target === "refine"
+            ? `Refine the existing skill "${verdict.skill}". Read its current SKILL.md first and \
+produce the COMPLETE updated body, preserving what is still correct.`
+            : `Create a new skill named "${verdict.skill}".`;
+
+    return `[self-learn] A reviewer model watching this session judged that the work just \
+completed contains a durable, reusable lesson.
+
+Its rationale: ${verdict.rationale}
+
+${target}
+
+Write the lesson so it will be useful in a FUTURE, UNRELATED session: state the trap and the \
+reliable technique, not the specifics of this task. Be concise and concrete.
+
+When the draft is ready, call the \`propose_skill\` tool with it. Do NOT write any file yourself — \
+the extension handles writing after the user approves. Then stop; a one-line summary is enough. \
+If on reflection there is no genuinely durable lesson here, call \`propose_skill\` with \
+\`decline: true\` and a brief reason instead.`;
+}
+
+function escalate(session, verdict) {
+    if (state.pendingProposal) {
+        debug("escalation skipped: a proposal is already pending");
+        return;
+    }
+    state.reflecting = true;
+    debug(`escalating to main agent: ${verdict.target} "${verdict.skill}"`);
+
+    // Deferred: sending from inside an event handler risks re-entering the agent loop.
+    setTimeout(() => {
+        session.send({ prompt: buildReflectionNudge(verdict) }).catch((err) => {
+            state.reflecting = false;
+            state.lastError = `escalation failed: ${err?.message ?? err}`;
+            debug(state.lastError);
+        });
+    }, 0);
+}
+
+// Approval is deliberately deferred by one user turn: `session.idle` fires exactly as the user
+// regains the keyboard, so confirming there would collide with the reply they were about to type.
+async function resolvePendingProposal(session) {
+    const p = state.pendingProposal;
+    if (!p || p.deferred) return false;
+
+    state.pendingProposal = null;
+
+    // Label from what is actually on disk, not from the declared mode, so a "new" proposal that
+    // collides with an existing skill is presented as the overwrite it really is.
+    let exists = false;
+    try {
+        exists = existsSync((await resolveSkillFile(session, p.name)).file);
+    } catch (err) {
+        state.lastError = `path check failed: ${err?.message ?? err}`;
+        debug(state.lastError);
+        await session.log(`self-learn: rejected proposal — ${state.lastError}`, { level: "error" });
+        return true;
+    }
+
+    const where = exists ? `OVERWRITE the existing skill "${p.name}"` : `create new skill "${p.name}"`;
+    const disabledNote = p.targetDisabled
+        ? `\n\nNote: "${p.name}" is currently DISABLED in your settings, so this change will not \
+take effect until you re-enable it.`
+        : "";
+    const backupNote = exists ? "\nThe previous version is kept as SKILL.md.bak." : "";
+
+    const message = `self-learn wants to ${where}.\n\n${p.description}\n\n${truncate(p.body, 800)}\
+${backupNote}${disabledNote}\n\nWrite it?`;
+
+    let approved = false;
+    try {
+        approved = await session.ui.confirm(message);
+    } catch (err) {
+        state.lastError = `confirm failed: ${err?.message ?? err}`;
+        debug(state.lastError);
+        return false;
+    }
+
+    if (!approved) {
+        debug(`proposal "${p.name}" declined by user`);
+        await session.log(`self-learn: discarded proposal for "${p.name}"`);
+        return true;
+    }
+
+    try {
+        const file = await writeSkill(session, p);
+        state.written++;
+        await session.log(`self-learn: wrote ${file}`);
+    } catch (err) {
+        state.lastError = `write failed: ${err?.message ?? err}`;
+        debug(state.lastError);
+        await session.log(`self-learn: write failed — ${state.lastError}`, { level: "error" });
+    }
+    return true;
+}
+
 const session = await joinSession({
+    tools: [
+        {
+            name: "propose_skill",
+            description:
+                "Submit a drafted skill for the self-learn extension to write after user " +
+                "approval. Only call this when self-learn has explicitly asked you to reflect. " +
+                "Do not write skill files yourself.",
+            parameters: {
+                type: "object",
+                properties: {
+                    decline: {
+                        type: "boolean",
+                        description: "True if on reflection there is no durable lesson worth saving.",
+                    },
+                    reason: { type: "string", description: "Why you declined, when decline is true." },
+                    mode: { type: "string", enum: ["new", "refine"], description: "Create or update." },
+                    name: { type: "string", description: "Kebab-case skill name." },
+                    description: {
+                        type: "string",
+                        description: "One-line frontmatter description: when this skill applies.",
+                    },
+                    body: {
+                        type: "string",
+                        description:
+                            "Complete markdown body, without frontmatter. For mode=refine this " +
+                            "must be the full updated content, not a fragment.",
+                    },
+                },
+                required: [],
+            },
+            skipPermission: true,
+            handler: async (args) => {
+                if (!state.reflecting) {
+                    return {
+                        textResultForLlm:
+                            "propose_skill is only valid during a self-learn reflection. Ignoring.",
+                        resultType: "rejected",
+                    };
+                }
+                state.reflecting = false;
+
+                if (args?.decline) {
+                    debug(`agent declined to propose: ${args?.reason ?? "(no reason)"}`);
+                    return "Noted — nothing recorded.";
+                }
+
+                const proposal = {
+                    mode: args?.mode === "refine" ? "refine" : "new",
+                    name: (args?.name ?? "").trim(),
+                    description: (args?.description ?? "").trim(),
+                    body: args?.body ?? "",
+                };
+
+                const problem = validateProposal(proposal);
+                if (problem) {
+                    debug(`rejected proposal: ${problem}`);
+                    return { textResultForLlm: `Proposal rejected: ${problem}`, resultType: "failure" };
+                }
+
+                // Refining a disabled skill would silently have no effect; surface it at approval.
+                try {
+                    const { skills } = await session.rpc.skills.list();
+                    const existing = skills.find((s) => s.name === proposal.name);
+                    proposal.targetDisabled = existing ? existing.enabled === false : false;
+                } catch {
+                    proposal.targetDisabled = false;
+                }
+
+                // Held until after the user's next turn so the dialog never lands on the moment
+                // they regain the keyboard.
+                proposal.deferred = true;
+                state.pendingProposal = proposal;
+                debug(`proposal captured: ${proposal.mode} "${proposal.name}" (deferred)`);
+
+                return `Recorded. The user will be asked to approve "${proposal.name}" after your next turn.`;
+            },
+        },
+    ],
+
     hooks: {
         onUserPromptSubmitted: async (input) => {
             state.goal = input.prompt ?? "";
             state.toolCallsThisTurn = 0;
+            // A held proposal becomes eligible once the user has taken their next turn.
+            if (state.pendingProposal?.deferred) {
+                state.pendingProposal.deferred = false;
+                debug(`proposal "${state.pendingProposal.name}" is now eligible for approval`);
+            }
         },
         onPostToolUse: async (input) => countToolCall(input?.toolName),
         onPostToolUseFailure: async (input) => countToolCall(input?.toolName),
@@ -432,6 +706,9 @@ const session = await joinSession({
                         `config:         ${config._configPath ?? "built-in defaults"}`,
                         `turns screened: ${state.screenedTurns}`,
                         `hits:           ${state.hits}`,
+                        `skills written: ${state.written}`,
+                        `pending:        ${state.pendingProposal ? `${state.pendingProposal.mode} "${state.pendingProposal.name}"${state.pendingProposal.deferred ? " (held)" : " (awaiting approval)"}` : "none"}`,
+                        `write enabled:  ${cfg("write")}`,
                         `last verdict:   ${v ? (v.worthLearning ? `${v.target} ${v.skill}` : "nothing") : "none"}`,
                         `last error:     ${state.lastError ?? "none"}`,
                     ].join("\n"),
@@ -456,6 +733,19 @@ const session = await joinSession({
                     `delivered event types (${rows.length}):\n` +
                         rows.map(([k, n]) => `  ${k} = ${n}`).join("\n"),
                 );
+            },
+        },
+        {
+            name: "learn-discard",
+            description: "Discard the pending self-learn proposal without writing it",
+            handler: async () => {
+                if (!state.pendingProposal) {
+                    await session.log("self-learn: no pending proposal");
+                    return;
+                }
+                const name = state.pendingProposal.name;
+                state.pendingProposal = null;
+                await session.log(`self-learn: discarded pending proposal "${name}"`);
             },
         },
         {
@@ -509,14 +799,47 @@ function dumpDeliveredTypes() {
 // `session.idle` fires exactly once per yield to the user, and unlike `assistant.idle` it also
 // guarantees background work has settled — so the transcript is complete rather than mid-flight.
 session.on("session.idle", (event) => {
-    debug(`session.idle fired (aborted=${event?.data?.aborted === true}, toolCalls=${state.toolCallsThisTurn})`);
+    debug(
+        `session.idle fired (aborted=${event?.data?.aborted === true}, toolCalls=${state.toolCallsThisTurn}, ` +
+            `reflecting=${state.reflecting}, pending=${state.pendingProposal?.name ?? "none"})`,
+    );
     if (event?.data?.aborted) {
         debug("skip: turn was aborted");
         state.toolCallsThisTurn = 0;
         return;
     }
-    if (state.reflecting) return;
-    void screen(session).catch((err) => debug(`screen threw: ${err?.message ?? err}`));
+
+    void (async () => {
+        // The escalated reflection turn has now ended, whether or not the agent actually called
+        // propose_skill. Clearing here prevents a silent agent from wedging the flag true and
+        // suppressing all further screening for the rest of the session.
+        if (state.reflecting) {
+            state.reflecting = false;
+            state.toolCallsThisTurn = 0;
+            debug(
+                state.pendingProposal
+                    ? "reflection turn ended; proposal captured"
+                    : "reflection turn ended without a proposal — clearing flag",
+            );
+            return;
+        }
+
+        // Approval next: a held proposal is resolved before any new screening starts, so at most
+        // one proposal is ever in flight.
+        if (await resolvePendingProposal(session)) {
+            state.toolCallsThisTurn = 0;
+            return;
+        }
+
+        if (state.pendingProposal) {
+            debug("skip: a proposal is still pending approval");
+            state.toolCallsThisTurn = 0;
+            return;
+        }
+
+        const verdict = await screen(session);
+        if (verdict?.worthLearning && cfg("write")) escalate(session, verdict);
+    })().catch((err) => debug(`idle handler threw: ${err?.message ?? err}`));
 });
 
 await session.log(
