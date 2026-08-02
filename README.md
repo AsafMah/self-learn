@@ -7,34 +7,38 @@ Companion to [`advisor`](../advisor).
 
 ## How it works
 
+The review runs **on request**, not on a timer: either the user asks, or the agent calls
+`self_learn_now` when it judges a substantive piece of work finished. Screening every yield was
+tried first and was too aggressive — most yields are mid-conversation, not task boundaries.
+
 ```
-session.idle  (fires exactly once per yield to the user)
-      │  gate: not aborted, >= minToolCalls this turn
+review requested  (user asks, or the agent calls self_learn_now at task completion)
       ▼
 STAGE 1 — screener sub-agent (cheap model, own context)
-  input: main-agent transcript delta + inventory of existing skills
+  input: main-agent transcript window + inventory of existing skills
   output: {"worthLearning", "target": "new"|"refine", "skill", "rationale"}
       │
       ├─ false ──► done. The common case.
       │
       ▼
-STAGE 2 — escalate to the main agent
-  session.send(nudge) so it drafts the skill with full context of its own reasoning,
-  then submits it by calling the `propose_skill` tool. The agent never writes the file.
+STAGE 2 — the main agent drafts the skill
+  it has full context of its own reasoning, and submits via the `propose_skill` tool.
+  The agent never writes the file.
       │
       ▼
-STAGE 3 — deferred approval
-  the proposal is HELD until the user has taken another turn, then confirmed via
-  session.ui.confirm() at the following yield, and only then written + skills.reload()
+STAGE 3 — approval
+  session.ui.confirm(), then write + skills.reload()
 ```
+
+Set `autoScreen: true` to additionally review automatically at every yield with at least
+`minToolCalls` tool calls. When that path is used, approval is **deferred by one user turn**:
+`session.idle` fires exactly as the user regains the keyboard, so confirming there would land the
+dialog on top of the reply they were about to type. A review the user asked for confirms at the
+end of that same turn instead, since they cannot be mid-reply.
 
 The hybrid split exists because screening is cheap and almost always negative, while drafting a
 good skill needs the main agent's own reasoning — which a sub-agent reading a transcript does not
 have.
-
-Approval is deferred by one user turn on purpose: `session.idle` fires exactly as the user regains
-the keyboard, so confirming there would land the dialog on top of the reply they were about to
-type.
 
 ## Safety
 
@@ -93,6 +97,8 @@ First match wins: `$COPILOT_SELF_LEARN_CONFIG`, `<cwd>/.github/self-learn.json`,
 | --- | --- | --- |
 | `enabled` | `true` | Master switch. |
 | `write` | `true` | When false, screen and log only — never escalate or write. |
+| `autoScreen` | `false` | Also review automatically at every qualifying yield. Off by default. |
+| `minToolCalls` | `5` | Only used when `autoScreen` is on. |
 | `skillsRoot` | `null` | Skills directory. `null` derives it from the runtime's own skill paths. |
 | `maxSkillBytes` | `65536` | Rejects oversized drafts. |
 | `screenerModel` | `gpt-5.6-terra` | Model for stage 1. Should differ from other extensions' models — see below. |
@@ -116,6 +122,7 @@ both surfaces.
 | `self_learn_now` (`action: "review"`) | Screen recent activity now; escalate on a hit. |
 | `self_learn_now` (`action: "status"`) | Counters and pending-proposal state. |
 | `self_learn_now` (`action: "discard"`) | Drop the pending proposal without writing it. |
+| `self_learn_now` (`action: "events"`) | Which session event types have actually been delivered. |
 | `propose_skill` | Used by the agent to submit a draft. Rejected outside a reflection. |
 
 In the CLI TUI these are also available as slash commands:

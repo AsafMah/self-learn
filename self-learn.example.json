@@ -4,6 +4,7 @@
     "agentType": "rubber-duck",
     "minToolCalls": 5,
     "write": true,
+    "autoScreen": false,
     "skillsRoot": null,
     "maxSkillBytes": 65536,
     "maxTranscriptChars": 24000,

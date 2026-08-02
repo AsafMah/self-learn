@@ -21,6 +21,10 @@ import { join, dirname, resolve, sep } from "node:path";
 const DEFAULTS = {
     enabled: true,
     write: true,
+    // Screening on every yield is aggressive: most yields are mid-conversation, not task
+    // boundaries. By default the review runs only when asked — by the user, or by the agent
+    // when it judges a substantive piece of work finished.
+    autoScreen: false,
     screenerModel: "gpt-5.6-terra",
     agentType: "rubber-duck",
     minToolCalls: 5,
@@ -763,19 +767,23 @@ const session = await joinSession({
         {
             name: "self_learn_now",
             description:
-                "Run a self-learn review of recent work now. Screens recent activity for a " +
-                "durable, reusable lesson and, if it finds one, asks you to draft it as a skill " +
-                "for the user to approve. Use when the user asks to run self-learn, capture a " +
-                "lesson, or check whether anything is worth learning. Also reports status.",
+                "Run a self-learn review: check whether recent work produced a durable, reusable " +
+                "lesson worth saving as a skill, and if so draft it for the user to approve.\n" +
+                "Call this when the user asks to run self-learn or capture a lesson, and also " +
+                "when you have just FINISHED a substantive piece of work — a task completed, a " +
+                "bug root-caused, a non-obvious behaviour discovered — and something was learned " +
+                "that would help in a future, unrelated session. Do not call it mid-task, after " +
+                "routine edits, or when the turn was simple question-answering.",
             parameters: {
                 type: "object",
                 properties: {
                     action: {
                         type: "string",
-                        enum: ["review", "status", "discard"],
+                        enum: ["review", "status", "discard", "events"],
                         description:
                             "review: screen and escalate on a hit. status: counters and pending " +
-                            "state. discard: drop the pending proposal without writing it.",
+                            "state. discard: drop the pending proposal without writing it. " +
+                            "events: which session event types have actually been delivered.",
                     },
                 },
                 required: [],
@@ -787,12 +795,19 @@ const session = await joinSession({
                 if (action === "status") {
                     const p = state.pendingProposal;
                     return [
-                        `enabled: ${cfg("enabled")}, write: ${cfg("write")}`,
+                        `enabled: ${cfg("enabled")}, write: ${cfg("write")}, autoScreen: ${cfg("autoScreen")}`,
                         `screener: ${cfg("screenerModel")} (${cfg("agentType")})`,
                         `turns screened: ${state.screenedTurns}, hits: ${state.hits}, written: ${state.written}`,
                         `pending: ${p ? `${p.mode} "${p.name}"${p.deferred ? " (held)" : " (awaiting approval)"}` : "none"}`,
                         `last error: ${state.lastError ?? "none"}`,
                     ].join("\n");
+                }
+
+                if (action === "events") {
+                    const rows = [...deliveredTypes.entries()].sort((a, b) => b[1] - a[1]);
+                    if (rows.length === 0) return "No events observed yet since this extension loaded.";
+                    return `Delivered event types (${rows.length}):\n` +
+                        rows.map(([k, n]) => `  ${k} = ${n}`).join("\n");
                 }
 
                 if (action === "discard") {
@@ -1109,7 +1124,8 @@ session.on("session.idle", (event) => {
         }
 
         // Approval next: a held proposal is resolved before any new screening starts, so at most
-        // one proposal is ever in flight.
+        // one proposal is ever in flight. This runs regardless of autoScreen — a proposal made
+        // on demand still needs its dialog.
         if (await resolvePendingProposal(session)) {
             state.toolCallsThisTurn = 0;
             return;
@@ -1121,13 +1137,21 @@ session.on("session.idle", (event) => {
             return;
         }
 
+        // Reviewing on every yield is aggressive and mostly negative; by default the review is
+        // requested explicitly instead.
+        if (!cfg("autoScreen")) {
+            state.toolCallsThisTurn = 0;
+            return;
+        }
+
         const verdict = await screen(session);
         if (verdict?.worthLearning && cfg("write")) escalate(session, verdict);
     })().catch((err) => debug(`idle handler threw: ${err?.message ?? err}`));
 });
 
 await session.log(
-    `self-learn ready — screening with ${cfg("screenerModel")} after >=${cfg("minToolCalls")} tool calls` +
+    `self-learn ready — review on request` +
+        (cfg("autoScreen") ? `, and automatically after >=${cfg("minToolCalls")} tool calls` : "") +
         (state.pendingProposal
             ? `; restored pending proposal "${state.pendingProposal.name}"`
             : ""),
