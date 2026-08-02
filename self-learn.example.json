@@ -1,0 +1,13 @@
+{
+    "enabled": true,
+    "screenerModel": "gpt-5.6-terra",
+    "agentType": "rubber-duck",
+    "minToolCalls": 5,
+    "maxTranscriptChars": 24000,
+    "maxToolResultChars": 1200,
+    "timeoutMs": 180000,
+    "pollIntervalMs": 2000,
+    "logToTimeline": true,
+    "debugLog": null,
+    "instructions": ""
+}

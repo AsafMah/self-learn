@@ -1,0 +1,7 @@
+# Local config
+self-learn.json
+
+# Logs
+*.log
+
+node_modules/
