@@ -114,7 +114,7 @@ First match wins: `$COPILOT_SELF_LEARN_CONFIG`, `<cwd>/.github/self-learn.json`,
 | `skillsRoot` | `null` | Skills directory. `null` derives it from the runtime's own skill paths. |
 | `maxSkillBytes` | `65536` | Rejects oversized drafts. |
 | `screenerModel` | `gpt-5.6-terra` | Model for stage 1. Should differ from other extensions' models — see below. |
-| `agentType` | `rubber-duck` | Built-in agent type. Only `explore`, `task`, `general-purpose`, `rubber-duck`, `code-review`, `research`, `security-review` are dispatchable. |
+| `agentType` | `explore` | Built-in agent type. Only `explore`, `task`, `general-purpose`, `rubber-duck`, `code-review`, `research`, `security-review` are dispatchable. **Do not use `rubber-duck`** — see below. |
 | `minToolCalls` | `5` | Turns with fewer tool calls are not worth screening. |
 | `maxTranscriptChars` | `24000` | Cap on the transcript slice sent to the screener. |
 | `maxToolResultChars` | `1200` | Per-tool-result truncation. |
@@ -150,6 +150,17 @@ In the CLI TUI these are also available as slash commands:
 ## Runtime findings
 
 These were established empirically and are why the code looks the way it does.
+
+**The screener's agent type biases its verdict.** The first version dispatched the screener as
+`rubber-duck`, whose built-in persona is *"a constructive critic… focuses on identifying weak
+points… and suggesting substantive improvements"*. That is a reasonable reviewer and a poor
+rejection gate: asked whether anything is worth learning, it is disposed to find something.
+Measured **5 hits in 7 screenings** before this was changed, against a prompt that explicitly said
+false should be the common answer. The screener now runs as `explore`, which carries no critical
+persona, and the prompt states a hard rubric rather than soft guidance.
+
+The wider lesson: the `agentType` passed to `startAgent` is not just a tool allowlist. It carries
+a system persona that shapes the answer, so pick one whose disposition matches the task.
 
 **`session.task_complete` comes from a built-in tool, not from sub-agents.** `task_complete`
 appears in the SDK's `BuiltInTools.Isolated` list alongside `ask_user`, `exit_plan_mode` and

@@ -1,7 +1,7 @@
 {
     "enabled": true,
     "screenerModel": "gpt-5.6-terra",
-    "agentType": "rubber-duck",
+    "agentType": "explore",
     "minToolCalls": 5,
     "write": true,
     "autoScreen": false,
