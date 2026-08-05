@@ -203,6 +203,14 @@ function truncate(text, limit) {
     return str.length <= limit ? str : `${str.slice(0, limit)}\n…[truncated ${str.length - limit} chars]`;
 }
 
+// A skill body is markdown and usually contains fenced code. Truncating it for a preview can cut
+// inside a fence, and an unclosed fence swallows everything rendered after it — which here would
+// be the target path and the question the user is meant to answer.
+function closeOpenFence(text) {
+    const fences = (text.match(/^```/gm) ?? []).length;
+    return fences % 2 === 0 ? text : `${text}\n\`\`\``;
+}
+
 // Fields whose value is an instruction addressed to another agent. Quoting them verbatim into a
 // review transcript lets a nested instruction be mistaken for the user's own requirement — an
 // observed failure, where a throwaway prompt sent to a probe sub-agent ("reply with exactly
@@ -870,9 +878,14 @@ take effect until you re-enable it.`
         const backupNote = exists ? "\nThe previous version is kept as SKILL.md.bak." : "";
         // Surfaced because a refine of a skill installed elsewhere writes outside the personal
         // skills directory, and a mistargeted refine would otherwise be invisible until too late.
-        const pathNote = `\n\nFile: ${target.file}`;
+        // The dialog body is rendered as markdown, and CommonMark treats a backslash before ASCII
+        // punctuation as an escape, so a bare Windows path loses separators: `...\me\.agents\...`
+        // renders as `...\me.agents\...`, which reads as a path bug that is not there. A code span
+        // suppresses escape processing, so the path shows exactly as it is on disk.
+        const pathNote = `\n\nFile: \`${target.file}\``;
 
-        const message = `self-learn wants to ${where}.\n\n${p.description}\n\n${truncate(p.body, 800)}\
+        const message = `self-learn wants to ${where}.\n\n${p.description}\n\n\
+${closeOpenFence(truncate(p.body, 800))}\
 ${backupNote}${pathNote}${disabledNote}\n\nWrite it?`;
 
         let approved = false;
