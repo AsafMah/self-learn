@@ -159,7 +159,7 @@ both surfaces.
 
 | Tool | Purpose |
 | --- | --- |
-| `self_learn_now` (`action: "review"`) | Screen recent activity now; escalate on a hit. |
+| `self_learn_now` (`action: "review"`) | Queue a screening for the end of the turn; escalate on a hit. |
 | `self_learn_now` (`action: "status"`) | Counters and pending-proposal state. |
 | `self_learn_now` (`action: "discard"`) | Drop the pending proposal without writing it. |
 | `self_learn_now` (`action: "events"`) | Which session event types have actually been delivered. |
@@ -296,6 +296,49 @@ extension, this extension, and the main agent's own sub-agents all emit the same
 "the first sub-agent started after my baseline" can silently claim another consumer's reply. The
 event-log path is retained only as a fallback and now requires a positive model match rather than
 guessing.
+
+## The review hang (CLI regression, worked around)
+
+Starting a screener sub-agent from **inside a tool handler** wedges the CLI. The extension finishes
+normally — it computes the verdict and emits `external_tool.completed` — but the CLI then emits
+nothing at all: no `postToolUse` hook, no `tool.execution_complete`, no `assistant.turn_end`. The
+turn hangs until the user aborts.
+
+Every `self_learn_now action:"review"` call on this machine, reconstructed from
+`~/.copilot/session-state/*/events.jsonl` by matching `tool.execution_start` against
+`tool.execution_complete` on `toolCallId`:
+
+| Date | Screener spawned? | Calls | CLI processed the result? |
+| --- | --- | --- | --- |
+| 2026-08-02 ×3, 2026-08-03 ×1 | yes | 4 | yes |
+| 2026-08-04 08:52, 2026-08-05 06:22 | no | 2 | yes |
+| 2026-08-04 08:56, 13:33; 2026-08-05 06:03, 08:10, 08:26, 09:50 | yes | 6 | **no — hung** |
+
+Two facts make this a CLI regression rather than an extension bug:
+
+- The split is clean, 6 completed against 6 hung, and both conditions are needed to hang: a screener
+  sub-agent **and** a date on or after 2026-08-04. Reviews that returned without spawning a screener
+  were unaffected.
+- The extension source did not change between `ec60ad6` (2026-08-02 15:48) and `e0d992f`
+  (2026-08-05 11:11). That interval contains the 2026-08-03 success and all six hangs, so identical
+  code both worked and hung. The Copilot SDK under
+  `%LOCALAPPDATA%\Programs\GitHub Copilot\copilot-sdk` was reinstalled on 2026-08-04.
+
+A same-window symptom points at the likely mechanism: extension-started sub-agents now surface in
+the **main agent's** notification stream ("agent *N* has finished processing and is now idle") while
+`read_agent` cannot resolve them. The CLI appears to have begun tracking extension-spawned agents in
+the session's background-agent registry, which would plausibly leave the tool call's bookkeeping
+waiting on an agent the extension has already disposed of. That last step is inference, not
+measurement — the request id never appears in any `~/.copilot/logs/process-*.log`.
+
+**Workaround.** `self_learn_now action:"review"` no longer screens. It sets `state.reviewRequested`
+and returns immediately; `session.idle` runs the screen once the turn has ended and escalates
+through the same deferred `session.send` an automatic screening uses. No sub-agent is ever alive
+while a tool call is open. The observable difference is that a forced review's reflection now
+arrives on the next turn rather than as the tool's own result.
+
+This should be reverted if the CLI stops wedging, since the in-handler version gave the verdict a
+turn earlier.
 
 ## Known limitations
 

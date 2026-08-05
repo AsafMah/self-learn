@@ -91,6 +91,7 @@ const state = {
     toolCallsThisTurn: 0,
     lastEventIndex: 0,
     screeningInFlight: false,
+    reviewRequested: null,
     reflecting: false,
     forcedReflection: false,
     resolvingProposal: false,
@@ -1021,6 +1022,7 @@ const session = await joinSession({
                         `enabled: ${cfg("enabled")}, write: ${cfg("write")}, autoScreen: ${cfg("autoScreen")}`,
                         `screener: ${cfg("screenerModel")} (${cfg("agentType")})`,
                         `turns screened: ${state.screenedTurns}, hits: ${state.hits}, written: ${state.written}`,
+                        `queued review: ${state.reviewRequested ? "yes (runs at end of turn)" : "no"}`,
                         `pending: ${p ? `${p.mode} "${p.name}"${p.deferred ? " (held)" : " (awaiting approval)"}` : "none"}`,
                         `last error: ${state.lastError ?? "none"}`,
                     ].join("\n");
@@ -1045,20 +1047,23 @@ const session = await joinSession({
                     return `A proposal for "${state.pendingProposal.name}" is already awaiting approval.`;
                 }
 
-                const verdict = await screen(session, { force: true, lookback: 600 });
-                if (verdict?.error) return `Screening failed: ${verdict.error}`;
-                if (!verdict?.worthLearning) {
-                    const why = verdict?.reason ?? verdict?.skipped;
-                    return `Nothing worth learning${why ? ` (${why})` : ""}. Report this to the user and stop.`;
-                }
-                if (!cfg("write")) return "A lesson was found, but writing is disabled in config.";
-
-                // Escalation normally happens in the idle handler; on-demand review escalates
-                // here so a forced run can actually lead to a write.
-                state.reflecting = true;
-                state.forcedReflection = true;
-                debug(`on-demand escalation: ${verdict.target} "${verdict.skill}"`);
-                return buildReflectionNudge(verdict);
+                // The screener must not run while this tool call is open. Starting a sub-agent
+                // from inside a tool handler wedges the CLI: the extension delivers its result
+                // (`external_tool.completed`) but the CLI never emits the matching `postToolUse`
+                // or `tool.execution_complete`, so the turn hangs until the user aborts. This
+                // reproduced 6/6 from 2026-08-04 onward and 0/6 before it, with the extension
+                // unchanged across the boundary — see README, "The review hang".
+                //
+                // So the request is only recorded here; `session.idle` runs it once the turn
+                // ends and escalates through the normal deferred-send path.
+                if (state.reviewRequested) return "A review is already queued for the end of this turn.";
+                state.reviewRequested = { lookback: 600 };
+                debug("review queued for end of turn");
+                return (
+                    "Review queued. It runs once this turn ends, so that the screener never " +
+                    "runs inside an open tool call. If a lesson is found you will be asked to " +
+                    "reflect on your next turn. Report that to the user and stop."
+                );
             },
         },
         {
@@ -1375,6 +1380,7 @@ session.on("session.idle", (event) => {
     if (event?.data?.aborted) {
         debug("skip: turn was aborted");
         state.toolCallsThisTurn = 0;
+        state.reviewRequested = null;
         return;
     }
 
@@ -1405,6 +1411,26 @@ session.on("session.idle", (event) => {
         if (state.pendingProposal) {
             debug("skip: a proposal is still pending approval");
             state.toolCallsThisTurn = 0;
+            state.reviewRequested = null;
+            return;
+        }
+
+        // A review requested through the tool runs here, not in the tool handler, so that the
+        // screener sub-agent is never alive while a tool call is open. It still escalates as a
+        // forced reflection, so an explicit request can lead to a write just as it used to.
+        if (state.reviewRequested) {
+            const { lookback } = state.reviewRequested;
+            state.reviewRequested = null;
+            const verdict = await screen(session, { force: true, lookback });
+            if (verdict?.error) {
+                debug(`requested review failed: ${verdict.error}`);
+            } else if (!verdict?.worthLearning) {
+                debug(`requested review: nothing worth learning (${verdict?.reason ?? verdict?.skipped ?? "no reason"})`);
+            } else if (!cfg("write")) {
+                debug("requested review found a lesson, but writing is disabled in config");
+            } else {
+                escalate(session, verdict, { forced: true });
+            }
             return;
         }
 
