@@ -144,7 +144,7 @@ First match wins: `$COPILOT_SELF_LEARN_CONFIG`, `<cwd>/.github/self-learn.json`,
 | `screenerModel` | `gpt-5.6-terra` | Model for stage 1. Should differ from other extensions' models — see below. |
 | `agentType` | `explore` | Built-in agent type. Only `explore`, `task`, `general-purpose`, `rubber-duck`, `code-review`, `research`, `security-review` are dispatchable. **Do not use `rubber-duck`** — see below. |
 | `minToolCalls` | `5` | Turns with fewer tool calls are not worth screening. |
-| `maxTranscriptChars` | `24000` | Cap on the transcript slice sent to the screener. |
+| `maxTranscriptChars` | `120000` | Cap on the transcript sent to the screener. When it binds, the head and tail are kept and the middle is elided. |
 | `maxToolResultChars` | `1200` | Per-tool-result truncation. |
 | `timeoutMs` | `180000` | How long to wait for the screener. |
 | `logToTimeline` | `true` | Surface hits in the session timeline. |

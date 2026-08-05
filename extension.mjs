@@ -38,7 +38,10 @@ const DEFAULTS = {
     // null = derive from the runtime's own skill paths rather than hardcoding a location.
     skillsRoot: null,
     maxSkillBytes: 65536,
-    maxTranscriptChars: 24000,
+    // A forced review looks back over a window rather than one turn, and measured 97k rendered
+    // characters for a 600-event window. A budget below that silently discarded the work being
+    // reviewed and left the screener judging the wrap-up.
+    maxTranscriptChars: 120000,
     maxToolResultChars: 1200,
     timeoutMs: 180000,
     pollIntervalMs: 2000,
@@ -238,7 +241,22 @@ function renderToolArgs(args) {
     return truncate(safe, 600);
 }
 
-function renderEvent(event) {
+// `tool.execution_complete` carries only a `toolCallId`, never a `toolName`, so a result can only
+// be attributed by pairing it with its `tool.execution_start`. Without this every result in the
+// transcript read `TOOL_RESULT undefined`, leaving the screener unable to tell which tool produced
+// which output — and leaving any name-based filter below silently ineffective on results.
+function indexToolNames(events) {
+    const names = new Map();
+    for (const event of events) {
+        const d = event?.data;
+        if (event?.type === "tool.execution_start" && d?.toolCallId && d?.toolName) {
+            names.set(d.toolCallId, d.toolName);
+        }
+    }
+    return names;
+}
+
+function renderEvent(event, toolNames) {
     const d = event?.data ?? {};
     switch (event?.type) {
         case "user.message":
@@ -250,11 +268,53 @@ function renderEvent(event) {
         case "tool.execution_complete": {
             const status = d.success === false ? "FAILED" : "ok";
             const body = d.success === false ? d.error : d.result;
-            return `TOOL_RESULT ${d.toolName} [${status}]: ${truncate(body, cfg("maxToolResultChars"))}`;
+            const name = toolNames?.get(d.toolCallId) ?? "unknown";
+            return `TOOL_RESULT ${name} [${status}]: ${truncate(body, cfg("maxToolResultChars"))}`;
         }
         default:
             return null;
     }
+}
+
+// Text that this extension itself put into the session. Feeding it back to the screener makes the
+// screener's own prior verdicts look like evidence for the lesson they describe: an observed
+// failure, where a review whose transcript was dominated by `Get-Content self-learn.log` output
+// rejected its own escalated lesson as "asserted but not demonstrated in the transcript" — the
+// only mention of it in the input was the verdict line the screener had written itself.
+const SELF_MARKER = "[self-learn]";
+const SELF_LOG_SIGNATURE =
+    /\d{4}-\d\d-\d\dT[\d:.]+Z (?:verdict|screening|escalating|screener|proposal|persisted|cleared|wrote)\b/;
+
+function isSelfReferential(toolName, line) {
+    if (OWN_TOOLS.has(toolName)) return true;
+    return line.includes(SELF_MARKER) || SELF_LOG_SIGNATURE.test(line);
+}
+
+// Keeping only the tail loses where the work started, which is where the problem was framed and
+// where the surprise usually lives; the tail is typically the wrap-up. Keep both ends and say how
+// much was dropped, at entry granularity so no entry is cut in half.
+function fitToBudget(lines, limit) {
+    const joined = lines.join("\n\n");
+    if (joined.length <= limit) return joined;
+
+    const head = [];
+    let used = 0;
+    for (const line of lines) {
+        if (used + line.length + 2 > Math.floor(limit / 3)) break;
+        head.push(line);
+        used += line.length + 2;
+    }
+
+    const tail = [];
+    for (let i = lines.length - 1; i >= head.length; i--) {
+        if (used + lines[i].length + 2 > limit) break;
+        tail.unshift(lines[i]);
+        used += lines[i].length + 2;
+    }
+
+    const omitted = lines.length - head.length - tail.length;
+    const middle = omitted > 0 ? [`…[${omitted} entries omitted from the middle]`] : [];
+    return [...head, ...middle, ...tail].join("\n\n");
 }
 
 async function buildTranscriptDelta(session, { lookback = 0 } = {}) {
@@ -275,12 +335,30 @@ async function buildTranscriptDelta(session, { lookback = 0 } = {}) {
     const delta = events.slice(from).filter((e) => !e?.agentId);
     state.lastEventIndex = events.length;
 
-    const lines = delta.map(renderEvent).filter(Boolean);
+    // Built from the full log, not the delta, so a result whose call started before the window
+    // still resolves to a tool name.
+    const toolNames = indexToolNames(events);
+
+    const rendered = delta
+        .map((event) => {
+            const line = renderEvent(event, toolNames);
+            if (!line) return null;
+            const name = event.data?.toolName ?? toolNames.get(event.data?.toolCallId);
+            return { line, self: isSelfReferential(name, line) };
+        })
+        .filter(Boolean);
+
+    const lines = rendered.filter((r) => !r.self).map((r) => r.line);
     if (lines.length === 0) return null;
 
-    let text = lines.join("\n\n");
-    const limit = cfg("maxTranscriptChars");
-    if (text.length > limit) text = `…[earlier activity omitted]\n\n${text.slice(-limit)}`;
+    const text = fitToBudget(lines, cfg("maxTranscriptChars"));
+    const unresolved = rendered.filter((r) => r.line.startsWith("TOOL_RESULT unknown ")).length;
+    // What the screener actually received. A verdict can only be judged sound or spurious against
+    // the evidence that reached it, and every past attempt to do so was guesswork.
+    debug(
+        `transcript: ${lines.length} entries (${rendered.length - lines.length} self-referential dropped, ` +
+            `${unresolved} unattributed results), ${text.length} of ${cfg("maxTranscriptChars")} chars`,
+    );
     return text;
 }
 

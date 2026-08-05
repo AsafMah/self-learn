@@ -8,7 +8,7 @@
     "screenOnTaskComplete": true,
     "skillsRoot": null,
     "maxSkillBytes": 65536,
-    "maxTranscriptChars": 24000,
+    "maxTranscriptChars": 120000,
     "maxToolResultChars": 1200,
     "timeoutMs": 180000,
     "pollIntervalMs": 2000,
