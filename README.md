@@ -252,7 +252,8 @@ lifecycle and a `task`-tool sub-agent both completed without emitting it, across
 delivered-event tally. It is therefore a genuine "the agent declares itself done" signal, but only
 in modes where that tool is enabled.
 
-It does **not** fire per sub-agent, and it never carries an `agentId`. Scanned across every
+On the evidence available it does **not** fire per sub-agent, and no observed occurrence carried an
+`agentId`. Scanned across every
 `events.jsonl` under `~/.copilot/session-state`: 8 `session.task_complete` events in total, none of
 which has an `agentId` key on the envelope at all (`keys=type,data,id,timestamp,parentId`). Each
 sits immediately before `assistant.turn_end`, with `data.summary` holding the main agent's final

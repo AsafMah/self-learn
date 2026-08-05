@@ -1347,10 +1347,11 @@ session.on("session.task_complete", (event) => {
             `summary=${truncate(d.summary ?? "", 200)})`,
     );
 
-    // Defensive only: measured across every session log, `session.task_complete` never carries an
-    // `agentId` and fires once per main-agent turn end, not per sub-agent (`subagent.completed` is
-    // the event that signals that). Kept because it costs nothing and the tool's availability per
-    // agent type is not a stable guarantee — but it is a no-op, not a working sub-agent guard.
+    // Defensive only: across every session log scanned (8 occurrences, so thin evidence), this
+    // event never carried an `agentId` and was only ever observed at a main-agent turn end, not
+    // per sub-agent — `subagent.completed` is the event that signals that. Kept because it costs
+    // nothing and the tool's availability per agent type is not a stable guarantee, but on current
+    // evidence it is a no-op rather than a working sub-agent guard.
     if (event?.agentId) return;
 
     if (!cfg("enabled") || !cfg("screenOnTaskComplete")) return;
