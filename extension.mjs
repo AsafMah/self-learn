@@ -443,9 +443,16 @@ function parseVerdict(raw, transcript) {
     for (const name of RUBRIC_CRITERIA) {
         const c = parsed.criteria?.[name];
         if (!c || typeof c.pass !== "boolean") return reject(`criterion "${name}" missing or malformed`);
-        if (!c.pass) failed.push(name);
+        // The screener's own reason is carried through: a bare list of failed criterion names
+        // cannot distinguish a rubric that is working from one that is misjudging, which left an
+        // earlier run of rejections uninvestigable. Whitespace is collapsed to keep the debug log
+        // one entry per line.
+        if (!c.pass) {
+            const why = sanitize(c.why, 200).replace(/\s+/g, " ").trim();
+            failed.push(`${name} (${why || "no reason given"})`);
+        }
     }
-    if (failed.length > 0) return reject(`failed: ${failed.join(", ")}`);
+    if (failed.length > 0) return reject(`failed: ${failed.join("; ")}`);
 
     // Every criterion claims to pass, so the quote backing "expensive" must hold up.
     const quote = parsed.criteria.expensive?.quote;
