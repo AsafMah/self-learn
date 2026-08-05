@@ -105,6 +105,43 @@ const state = {
 
 const cfg = (key) => state.sessionOverrides[key] ?? config[key];
 
+// This extension's own tools, which are not agent activity worth counting.
+const OWN_TOOLS = new Set(["self_learn_now", "propose_skill"]);
+
+// An extension's tools are offered to `task`-tool sub-agents as well as to the main agent, and
+// `self_learn_now`'s description reads to a sub-agent as an instruction to call it the moment its
+// own work is done. Observed: a code-review sub-agent finished its review, called it, and dragged
+// the session that spawned it into a screening and an escalated reflection turn. Nothing here is
+// meant to run for a subtask — the screener reads only main-agent activity, and only the main
+// agent has the context to draft a skill — so sub-agent calls are refused outright.
+const SUBAGENT_TOOL_CALL_MEMORY = 200;
+const subAgentToolCalls = new Set();
+
+function noteSubAgentToolCall(event) {
+    const id = event?.data?.toolCallId;
+    if (!event?.agentId || !id) return;
+    subAgentToolCalls.add(id);
+    // A Set iterates in insertion order, so the first key is the oldest.
+    if (subAgentToolCalls.size > SUBAGENT_TOOL_CALL_MEMORY) {
+        subAgentToolCalls.delete(subAgentToolCalls.values().next().value);
+    }
+}
+
+// `ToolInvocation` carries no agent identity, so the caller is resolved through the event log.
+// The SDK invokes a tool handler from inside its own dispatch of `external_tool.requested`,
+// synchronously *before* that event reaches the extension's listeners; yielding once lets the
+// listener record the call first, which makes the lookup ordered rather than racy.
+async function isSubAgentCall(invocation) {
+    const id = invocation?.toolCallId;
+    if (!id) return false;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    return subAgentToolCalls.has(id);
+}
+
+const SUBAGENT_REFUSAL =
+    "self-learn does not run for sub-agent tasks. Finish your own task and report the result — " +
+    "the main agent decides whether the work produced a durable lesson.";
+
 function debug(message) {
     const path = cfg("debugLog");
     if (!path) return;
@@ -925,7 +962,12 @@ const session = await joinSession({
                 required: [],
             },
             skipPermission: true,
-            handler: async (args) => {
+            handler: async (args, invocation) => {
+                if (await isSubAgentCall(invocation)) {
+                    debug(`refused self_learn_now from sub-agent call ${invocation?.toolCallId}`);
+                    return { textResultForLlm: SUBAGENT_REFUSAL, resultType: "rejected" };
+                }
+
                 const action = args?.action ?? "review";
 
                 if (action === "status") {
@@ -1004,7 +1046,11 @@ const session = await joinSession({
                 required: [],
             },
             skipPermission: true,
-            handler: async (args) => {
+            handler: async (args, invocation) => {
+                if (await isSubAgentCall(invocation)) {
+                    debug(`refused propose_skill from sub-agent call ${invocation?.toolCallId}`);
+                    return { textResultForLlm: SUBAGENT_REFUSAL, resultType: "rejected" };
+                }
                 if (!state.reflecting) {
                     return {
                         textResultForLlm:
@@ -1097,8 +1143,6 @@ const session = await joinSession({
                 debug(`proposal "${state.pendingProposal.name}" is now eligible for approval`);
             }
         },
-        onPostToolUse: async (input) => countToolCall(input?.toolName),
-        onPostToolUseFailure: async (input) => countToolCall(input?.toolName),
     },
 
     commands: [
@@ -1198,8 +1242,13 @@ const session = await joinSession({
     ],
 });
 
-function countToolCall(toolName) {
-    if (typeof toolName === "string" && toolName.startsWith("learn")) return;
+// Counted from the event log rather than from `onPostToolUse`, because tool-use hooks also fire
+// for sub-agent tool calls and carry no agent identity — a subtask doing heavy work would
+// otherwise push the turn over `minToolCalls` and trigger an auto-screen on its own.
+function countToolCall(event) {
+    if (event?.agentId) return;
+    const toolName = event?.data?.toolName;
+    if (typeof toolName === "string" && OWN_TOOLS.has(toolName)) return;
     state.toolCallsThisTurn++;
 }
 
@@ -1213,6 +1262,11 @@ const deliveredTypes = new Map();
 session.on((event) => {
     const key = `${event?.type}${event?.agentId ? "@sub" : ""}`;
     deliveredTypes.set(key, (deliveredTypes.get(key) ?? 0) + 1);
+    if (event?.type === "external_tool.requested") noteSubAgentToolCall(event);
+    if (event?.type === "tool.execution_start") {
+        noteSubAgentToolCall(event);
+        countToolCall(event);
+    }
     if (event?.type === "assistant.usage") {
         const d = event?.data ?? {};
         debug(
@@ -1236,7 +1290,13 @@ restorePendingProposal(session);
 // listener may simply never fire.
 session.on("session.task_complete", (event) => {
     const d = event?.data ?? {};
-    debug(`session.task_complete (success=${d.success}, summary=${truncate(d.summary ?? "", 200)})`);
+    debug(
+        `session.task_complete (agent=${event?.agentId ?? "MAIN"}, success=${d.success}, ` +
+            `summary=${truncate(d.summary ?? "", 200)})`,
+    );
+
+    // A sub-agent declaring its own subtask done says nothing about the session's work.
+    if (event?.agentId) return;
 
     if (!cfg("enabled") || !cfg("screenOnTaskComplete")) return;
     // A task the agent reports as failed has no lesson worth trusting yet.
