@@ -107,7 +107,8 @@ uncovered`, which is what makes the bar tunable rather than mysterious.
   the companion `advisor` extension, which lacks this, issued a false `blocker` after reading a
   prompt sent to a probe sub-agent as though it were a user requirement.
 - **Nothing runs for a sub-agent task.** Both tools refuse a caller that is a `task`-tool
-  sub-agent, `session.task_complete` is ignored when it carries an `agentId`, and the per-turn
+  sub-agent, a sub-agent's opening prompt does not overwrite the goal or release a held proposal,
+  `session.task_complete` is ignored when it carries an `agentId`, and the per-turn
   tool-call counter skips sub-agent calls. See the runtime finding below.
 
 **Topical relevance is not enforced in code.** Whether a lesson genuinely belongs in the skill
@@ -224,6 +225,26 @@ turn's tool-call count was inflated by sub-agent activity — enough to push a t
 *Testing note:* a session-scoped extension whose **directory name** matches an installed user
 extension is silently skipped. Give a test copy a distinct directory name and rename its tools, or
 it will look like it loaded when the installed version is what actually ran.
+
+**A sub-agent's opening prompt is dispatched to `onUserPromptSubmitted` like the user's own.**
+This is the same class of bug as the tool exposure above but a worse one, because it corrupts state
+rather than merely wasting a turn. `state.goal` was overwritten by every subtask's brief — including
+this extension's *own* screener prompt, since the screener is started as an agent — while
+`state.toolCallsThisTurn` was reset mid-turn and a proposal deliberately held back until the user
+next spoke was released early. Measured over one real session: 20 `userPromptSubmitted` dispatches,
+only 5 of them actually the user.
+
+Hook payloads carry no agent identity, but hook dispatches are still attributable. The event log
+brackets each one in `hook.start` / `hook.end` events that **do** carry `agentId`, correlated by
+`hookInvocationId`, and `hook.start` reaches the extension before the handler runs (verified with a
+throwaway probe: `hook.start` arrived 1.1 s ahead, and the dispatch resolved to SUBAGENT). Since the
+main agent and a sub-agent can be inside the same hook type concurrently, the open brackets are
+matched on the prompt itself rather than on hook type alone. Attribution deliberately **fails open**
+— an unattributable dispatch is treated as the user's, which preserves behaviour instead of silently
+disabling the extension.
+
+`session.idle` and `session.task_complete` were checked for the same exposure and do not have it:
+across a full session, no event of either type ever carried an `agentId`.
 
 **`session.task_complete` comes from a built-in tool, not from sub-agents.** `task_complete`
 appears in the SDK's `BuiltInTools.Isolated` list alongside `ask_user`, `exit_plan_mode` and

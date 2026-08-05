@@ -142,6 +142,51 @@ const SUBAGENT_REFUSAL =
     "self-learn does not run for sub-agent tasks. Finish your own task and report the result — " +
     "the main agent decides whether the work produced a durable lesson.";
 
+// A sub-agent's opening prompt is dispatched to `onUserPromptSubmitted` exactly like the user's
+// own, and hook payloads carry no agent identity. Left unguarded, every subtask's brief — and
+// self-learn's own screener prompt, which is itself started as an agent — overwrites `state.goal`,
+// zeroes the turn's tool count and releases a proposal that was deliberately held back until the
+// user next spoke. Measured over one real session: 20 dispatches, only 5 of them the user.
+//
+// Hook dispatches are attributable even though their payloads are not: the event log brackets each
+// one in `hook.start` / `hook.end` events that do carry `agentId`, correlated by
+// `hookInvocationId`, and `hook.start` reaches the extension before the handler runs.
+const OPEN_HOOK_MEMORY = 50;
+const openHookDispatches = new Map();
+
+function noteHookStart(event) {
+    const data = event?.data;
+    if (!data?.hookInvocationId) return;
+    openHookDispatches.set(data.hookInvocationId, {
+        agentId: event.agentId ?? null,
+        hookType: data.hookType,
+        prompt: data.input?.prompt,
+    });
+    // Guards against a leak should a `hook.end` ever go missing. Insertion order, so oldest first.
+    if (openHookDispatches.size > OPEN_HOOK_MEMORY) {
+        openHookDispatches.delete(openHookDispatches.keys().next().value);
+    }
+}
+
+function noteHookEnd(event) {
+    const id = event?.data?.hookInvocationId;
+    if (id) openHookDispatches.delete(id);
+}
+
+// The main agent and a sub-agent can be inside the same hook type concurrently, so the open
+// brackets are matched on the prompt itself rather than on hook type alone. Attribution fails
+// open: a dispatch that cannot be attributed is treated as the user's, which preserves the
+// extension's behaviour rather than silently disabling it.
+async function isSubAgentPrompt(prompt) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    for (const dispatch of openHookDispatches.values()) {
+        if (dispatch.hookType === "userPromptSubmitted" && dispatch.prompt === prompt) {
+            return dispatch.agentId !== null;
+        }
+    }
+    return false;
+}
+
 function debug(message) {
     const path = cfg("debugLog");
     if (!path) return;
@@ -1134,7 +1179,12 @@ const session = await joinSession({
 
     hooks: {
         onUserPromptSubmitted: async (input) => {
-            state.goal = input.prompt ?? "";
+            const prompt = input.prompt ?? "";
+            if (await isSubAgentPrompt(prompt)) {
+                debug(`ignored userPromptSubmitted from a sub-agent (${prompt.length} chars)`);
+                return;
+            }
+            state.goal = prompt;
             state.toolCallsThisTurn = 0;
             // A held proposal becomes eligible once the user has taken their next turn.
             if (state.pendingProposal?.deferred) {
@@ -1263,6 +1313,8 @@ session.on((event) => {
     const key = `${event?.type}${event?.agentId ? "@sub" : ""}`;
     deliveredTypes.set(key, (deliveredTypes.get(key) ?? 0) + 1);
     if (event?.type === "external_tool.requested") noteSubAgentToolCall(event);
+    if (event?.type === "hook.start") noteHookStart(event);
+    if (event?.type === "hook.end") noteHookEnd(event);
     if (event?.type === "tool.execution_start") {
         noteSubAgentToolCall(event);
         countToolCall(event);
