@@ -106,6 +106,9 @@ uncovered`, which is what makes the bar tunable rather than mysterious.
   screener prompt states that only `USER:` lines carry the user's requirements. Not theoretical:
   the companion `advisor` extension, which lacks this, issued a false `blocker` after reading a
   prompt sent to a probe sub-agent as though it were a user requirement.
+- **Nothing runs for a sub-agent task.** Both tools refuse a caller that is a `task`-tool
+  sub-agent, `session.task_complete` is ignored when it carries an `agentId`, and the per-turn
+  tool-call counter skips sub-agent calls. See the runtime finding below.
 
 **Topical relevance is not enforced in code.** Whether a lesson genuinely belongs in the skill
 being refined is a judgement, guided by the screener prompt and checked by the user at approval.
@@ -187,12 +190,48 @@ persona, and the prompt states a hard rubric rather than soft guidance.
 The wider lesson: the `agentType` passed to `startAgent` is not just a tool allowlist. It carries
 a system persona that shapes the answer, so pick one whose disposition matches the task.
 
+**An extension's tools are offered to sub-agents, and its tool descriptions read to them as
+instructions.** A `task`-tool sub-agent sees `self_learn_now` and `propose_skill` in its own tool
+list — confirmed by asking a `code-review` sub-agent to name which of them it could see. Since
+`self_learn_now`'s description says to call it "when you have just FINISHED a substantive piece of
+work", every sub-agent that finishes work is being told to call it. Observed: a code-review
+sub-agent finished its review, called it, and dragged the spawning session into a screening and an
+escalated reflection turn.
+
+Nothing here is meant to run for a subtask — the screener reads only main-agent activity, and only
+the main agent has the context to draft a skill from its own reasoning — so sub-agent calls are
+refused outright.
+
+`ToolInvocation` carries no agent identity (only `sessionId`, `toolCallId`, `toolName`,
+`arguments`), so the caller is resolved through the event log instead: `tool.execution_start` and
+`external_tool.requested` carry an `agentId` that is present for sub-agents and absent for the main
+agent, alongside a `toolCallId` that matches the invocation's.
+
+*The ordering is the trap.* The SDK invokes a tool handler from inside its own dispatch of
+`external_tool.requested`, synchronously **before** that event reaches the extension's listeners,
+so a naive lookup always misses. Awaiting a single `setTimeout(…, 0)` lets the listener record the
+call first, which makes the check ordered rather than racy. Verified with a throwaway
+session-scoped extension: a main-agent call resolves to MAIN, a `code-review` sub-agent's call to
+SUBAGENT.
+
+Two adjacent paths had the same blind spot. `session.task_complete` fires for sub-agents too, and a
+subtask declaring itself done says nothing about the session's work. And the `onPostToolUse` /
+`onPostToolUseFailure` hooks fire for sub-agent tool calls while carrying no agent identity, so a
+turn's tool-call count was inflated by sub-agent activity — enough to push a turn past
+`minToolCalls` and auto-screen on its own. The counter now reads `tool.execution_start`, where
+`agentId` is available.
+
+*Testing note:* a session-scoped extension whose **directory name** matches an installed user
+extension is silently skipped. Give a test copy a distinct directory name and rename its tools, or
+it will look like it loaded when the installed version is what actually ran.
+
 **`session.task_complete` comes from a built-in tool, not from sub-agents.** `task_complete`
 appears in the SDK's `BuiltInTools.Isolated` list alongside `ask_user`, `exit_plan_mode` and
 `task`; the event is emitted when the agent calls it. Measured: a full RPC-started sub-agent
 lifecycle and a `task`-tool sub-agent both completed without emitting it, across a 42-type
 delivered-event tally. It is therefore a genuine "the agent declares itself done" signal, but only
-in modes where that tool is enabled.
+in modes where that tool is enabled. The handler still ignores events carrying an `agentId`, since
+that costs nothing and the tool's availability per agent type is not a stable guarantee.
 
 **`session.idle` is the only correct yield signal.** Measured over one turn: `session.idle` = 1,
 `assistant.idle [MAIN]` = 1, `assistant.turn_end [MAIN]` = 10. `turn_end` fires per agentic
