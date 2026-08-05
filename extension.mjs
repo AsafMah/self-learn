@@ -1347,7 +1347,10 @@ session.on("session.task_complete", (event) => {
             `summary=${truncate(d.summary ?? "", 200)})`,
     );
 
-    // A sub-agent declaring its own subtask done says nothing about the session's work.
+    // Defensive only: measured across every session log, `session.task_complete` never carries an
+    // `agentId` and fires once per main-agent turn end, not per sub-agent (`subagent.completed` is
+    // the event that signals that). Kept because it costs nothing and the tool's availability per
+    // agent type is not a stable guarantee — but it is a no-op, not a working sub-agent guard.
     if (event?.agentId) return;
 
     if (!cfg("enabled") || !cfg("screenOnTaskComplete")) return;

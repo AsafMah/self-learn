@@ -108,8 +108,7 @@ uncovered`, which is what makes the bar tunable rather than mysterious.
   prompt sent to a probe sub-agent as though it were a user requirement.
 - **Nothing runs for a sub-agent task.** Both tools refuse a caller that is a `task`-tool
   sub-agent, a sub-agent's opening prompt does not overwrite the goal or release a held proposal,
-  `session.task_complete` is ignored when it carries an `agentId`, and the per-turn
-  tool-call counter skips sub-agent calls. See the runtime finding below.
+  and the per-turn tool-call counter skips sub-agent calls. See the runtime finding below.
 
 **Topical relevance is not enforced in code.** Whether a lesson genuinely belongs in the skill
 being refined is a judgement, guided by the screener prompt and checked by the user at approval.
@@ -215,8 +214,7 @@ call first, which makes the check ordered rather than racy. Verified with a thro
 session-scoped extension: a main-agent call resolves to MAIN, a `code-review` sub-agent's call to
 SUBAGENT.
 
-Two adjacent paths had the same blind spot. `session.task_complete` fires for sub-agents too, and a
-subtask declaring itself done says nothing about the session's work. And the `onPostToolUse` /
+One adjacent path had the same blind spot: the `onPostToolUse` /
 `onPostToolUseFailure` hooks fire for sub-agent tool calls while carrying no agent identity, so a
 turn's tool-call count was inflated by sub-agent activity — enough to push a turn past
 `minToolCalls` and auto-screen on its own. The counter now reads `tool.execution_start`, where
@@ -244,15 +242,28 @@ matched on the prompt itself rather than on hook type alone. Attribution deliber
 disabling the extension.
 
 `session.idle` and `session.task_complete` were checked for the same exposure and do not have it:
-across a full session, no event of either type ever carried an `agentId`.
+across a full session, no event of either type ever carried an `agentId`. See below for the wider
+scan of `session.task_complete`.
 
 **`session.task_complete` comes from a built-in tool, not from sub-agents.** `task_complete`
 appears in the SDK's `BuiltInTools.Isolated` list alongside `ask_user`, `exit_plan_mode` and
 `task`; the event is emitted when the agent calls it. Measured: a full RPC-started sub-agent
 lifecycle and a `task`-tool sub-agent both completed without emitting it, across a 42-type
 delivered-event tally. It is therefore a genuine "the agent declares itself done" signal, but only
-in modes where that tool is enabled. The handler still ignores events carrying an `agentId`, since
-that costs nothing and the tool's availability per agent type is not a stable guarantee.
+in modes where that tool is enabled.
+
+It does **not** fire per sub-agent, and it never carries an `agentId`. Scanned across every
+`events.jsonl` under `~/.copilot/session-state`: 8 `session.task_complete` events in total, none of
+which has an `agentId` key on the envelope at all (`keys=type,data,id,timestamp,parentId`). Each
+sits immediately before `assistant.turn_end`, with `data.summary` holding the main agent's final
+answer. The decisive case is one session with **43 `subagent.started` events and exactly one
+`session.task_complete`**, at a main-agent turn end. The handler's `agentId` check is therefore a
+no-op rather than a working guard; it is kept only because the tool's availability per agent type is
+not a stable guarantee, and it costs nothing. **Do not build a real sub-agent guard on it.**
+`subagent.completed` is the event that actually signals sub-agent completion, and it does carry
+`agentId`, alongside `toolCallId`, `agentName`, `totalToolCalls`, `totalTokens` and `durationMs`.
+(Caveat: 8 events is thin evidence, and most of those logs predate the current CLI. The
+43-to-1 session is the strongest single data point, not a proof across SDK versions.)
 
 **`session.idle` is the only correct yield signal.** Measured over one turn: `session.idle` = 1,
 `assistant.idle [MAIN]` = 1, `assistant.turn_end [MAIN]` = 10. `turn_end` fires per agentic
