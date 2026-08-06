@@ -96,7 +96,6 @@ const state = {
     screeningInFlight: false,
     reviewRequested: null,
     reflecting: false,
-    forcedReflection: false,
     resolvingProposal: false,
     screenedTurns: 0,
     hits: 0,
@@ -890,9 +889,6 @@ function escalate(session, verdict, { forced = false } = {}) {
         return;
     }
     state.reflecting = true;
-    // An explicitly forced reflection confirms at the end of that same turn: the user just asked
-    // for it, so the dialog cannot be colliding with a reply they were composing.
-    state.forcedReflection = forced;
     debug(`escalating to main agent: ${verdict.target} "${verdict.skill}" (forced=${forced})`);
 
     // Deferred: sending from inside an event handler risks re-entering the agent loop.
@@ -905,18 +901,23 @@ function escalate(session, verdict, { forced = false } = {}) {
     }, 0);
 }
 
-// Approval is deliberately deferred by one user turn: `session.idle` fires exactly as the user
-// regains the keyboard, so confirming there would collide with the reply they were about to type.
+// Raised while the proposing tool call is still open, so the dialog sits inside a turn the host
+// can finish. Resolving an elicitation after `assistant.turn_end` leaves the app showing "running"
+// with no turn left to end and no event an extension can emit to clear it — measured: turn_end at
+// 07:49:11, approval at 07:54:11, the write succeeded, and the UI stayed wedged.
+//
+// Returns what happened, so the caller can tell the agent and so the idle fallback knows whether
+// a proposal is still outstanding.
 async function resolvePendingProposal(session) {
     const p = state.pendingProposal;
-    if (!p || p.deferred) return false;
+    if (!p || p.deferred) return "none";
 
     // The proposal is deliberately NOT cleared up front: a confirm exception, a reload during the
     // dialog, or a failed write would otherwise destroy the draft, which is exactly what
     // persisting it is meant to prevent. It is cleared only on an explicit decline, a successful
     // write, or an outcome that can never succeed. An in-flight guard replaces early clearing as
     // the re-entrancy protection.
-    if (state.resolvingProposal) return false;
+    if (state.resolvingProposal) return "none";
     state.resolvingProposal = true;
 
     // Bounds any failure that would otherwise re-prompt on every yield.
@@ -930,7 +931,7 @@ async function resolvePendingProposal(session) {
             `self-learn: giving up on proposal "${p.name}" after repeated failures — ${state.lastError ?? "unknown error"}`,
             { level: "error" },
         );
-        return true;
+        return "abandoned";
     }
     persistPendingProposal(session);
 
@@ -951,7 +952,7 @@ async function resolvePendingProposal(session) {
             state.lastError = `path check failed: ${err?.message ?? err}`;
             discard(state.lastError);
             await session.log(`self-learn: rejected proposal — ${state.lastError}`, { level: "error" });
-            return true;
+            return "abandoned";
         }
 
         const exists = existsSync(target.file);
@@ -980,15 +981,16 @@ ${backupNote}${pathNote}${disabledNote}\n\nWrite it?`;
             // Kept for another attempt: the host may not have been ready to show a dialog.
             state.lastError = `confirm failed: ${err?.message ?? err}`;
             debug(`${state.lastError} — proposal "${p.name}" retained`);
-            return false;
+            return "retained";
         }
 
         if (!approved) {
             discard("declined by user");
             await session.log(`self-learn: discarded proposal for "${p.name}"`);
-            return true;
+            return "declined";
         }
 
+        let outcome = "written";
         try {
             const file = await writeSkill(session, p);
             discard("written");
@@ -1002,8 +1004,9 @@ ${backupNote}${pathNote}${disabledNote}\n\nWrite it?`;
                 `self-learn: write failed, proposal kept — ${state.lastError}`,
                 { level: "error" },
             );
+            outcome = "retained";
         }
-        return true;
+        return outcome;
     } finally {
         state.resolvingProposal = false;
     }
@@ -1265,17 +1268,26 @@ const session = await joinSession({
                 // Refining a disabled skill would silently have no effect; surface it at approval.
                 proposal.targetDisabled = existing ? existing.enabled === false : false;
 
-                // Held until after the user's next turn so the dialog never lands on the moment
-                // they regain the keyboard — unless the user forced this reflection themselves.
-                proposal.deferred = !state.forcedReflection;
-                state.forcedReflection = false;
+                proposal.deferred = false;
                 state.pendingProposal = proposal;
                 persistPendingProposal(session);
-                debug(`proposal captured: ${proposal.mode} "${proposal.name}" (deferred=${proposal.deferred})`);
+                debug(`proposal captured: ${proposal.mode} "${proposal.name}"`);
 
-                return proposal.deferred
-                    ? `Recorded. The user will be asked to approve "${proposal.name}" after their next turn.`
-                    : `Recorded. The user will be asked to approve "${proposal.name}" at the end of this turn.`;
+                // Confirmed here, inside the open tool call, rather than at idle. The dialog then
+                // belongs to a turn the host can finish; raised after the turn ended, the approval
+                // resolved and the write succeeded but the app stayed stuck showing "running".
+                const outcome = await resolvePendingProposal(session);
+                switch (outcome) {
+                    case "written":
+                        return `Approved and written. Tell the user the skill "${proposal.name}" was saved.`;
+                    case "declined":
+                        return `The user declined. Nothing was written; do not retry or write it yourself.`;
+                    case "abandoned":
+                        return `Could not be saved: ${state.lastError ?? "unknown error"}. Do not retry.`;
+                    default:
+                        // "retained" or "none": kept on disk, and the idle handler tries again.
+                        return `Recorded, but approval could not be completed now (${state.lastError ?? "dialog unavailable"}). The user will be asked again.`;
+                }
             },
         },
     ],
@@ -1488,7 +1500,6 @@ session.on("session.idle", (event) => {
         // suppressing all further screening for the rest of the session.
         if (state.reflecting) {
             state.reflecting = false;
-            state.forcedReflection = false;
             state.toolCallsThisTurn = 0;
             debug(
                 state.pendingProposal
@@ -1498,10 +1509,10 @@ session.on("session.idle", (event) => {
             return;
         }
 
-        // Approval next: a held proposal is resolved before any new screening starts, so at most
-        // one proposal is ever in flight. This runs regardless of autoScreen — a proposal made
-        // on demand still needs its dialog.
-        if (await resolvePendingProposal(session)) {
+        // Approval fallback: a proposal normally resolves inside the propose_skill call, so this
+        // only catches one restored from disk after a reload, or one whose dialog could not be
+        // shown at the time.
+        if ((await resolvePendingProposal(session)) !== "none") {
             state.toolCallsThisTurn = 0;
             return;
         }

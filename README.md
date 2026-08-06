@@ -36,10 +36,11 @@ STAGE 3 — approval
 ```
 
 Set `autoScreen: true` to additionally review automatically at every yield with at least
-`minToolCalls` tool calls. When that path is used, approval is **deferred by one user turn**:
-`session.idle` fires exactly as the user regains the keyboard, so confirming there would land the
-dialog on top of the reply they were about to type. A review the user asked for confirms at the
-end of that same turn instead, since they cannot be mid-reply.
+`minToolCalls` tool calls.
+
+Approval happens **inside the `propose_skill` tool call**, not at the next yield. An elicitation
+raised after the turn has ended leaves the host UI stuck showing "running" — see "The approval
+dialog must stay inside a turn" below.
 
 The hybrid split exists because screening is cheap and almost always negative, while drafting a
 good skill needs the main agent's own reasoning — which a sub-agent reading a transcript does not
@@ -339,6 +340,41 @@ arrives on the next turn rather than as the tool's own result.
 
 This should be reverted if the CLI stops wedging, since the in-handler version gave the verdict a
 turn earlier.
+
+## The approval dialog must stay inside a turn
+
+`session.ui.confirm` is an MCP elicitation. Raising one **after** the turn has ended puts the app
+into a "running" state it can never leave: the elicitation makes it show activity, but there is no
+turn left to end and no event an extension can emit to clear it.
+
+This was measured, not guessed. Approval was originally raised from `session.idle`:
+
+```
+07:49:11.384  assistant.turn_end          ← turn already over
+07:49:13.216  hook.end sessionEnd         ← session wound down
+07:49:13.231  session.usage_checkpoint    ← last event before the gap
+    ~5 min    dialog shown; user approves
+07:54:11.653  session.info "wrote ...SKILL.md"
+              (nothing after — no turn_start, no turn_end)
+```
+
+The extension side was provably correct: the approval resolved, the file was written, the pending
+proposal was cleared. The UI stayed stuck anyway, and had to be stopped by hand. The same happened
+on decline, so it is a property of *when* the dialog is raised, not of the answer given.
+
+**Fix.** `propose_skill` now confirms and writes inside its own tool call, so the dialog belongs to
+a turn the host can finish. Verified on the same path: `external_tool.requested` → dialog →
+approval → write → `external_tool.completed` → `tool.execution_complete` → `assistant.turn_end`,
+and the indicator cleared itself.
+
+The original reason for deferring — that `session.idle` fires as the user regains the keyboard, so
+a dialog there could land on a reply being typed — no longer applies, because during an open tool
+call the user is already waiting on the agent. `state.forcedReflection` and the one-turn hold it
+controlled are gone. `session.idle` still resolves a proposal restored from disk after a reload, or
+one whose dialog could not be shown at the time.
+
+Note this is the opposite constraint to the review hang above: a **sub-agent** must not be started
+inside a tool handler, while an **elicitation** must be raised inside one.
 
 ## Known limitations
 
