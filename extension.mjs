@@ -96,6 +96,7 @@ const state = {
     screeningInFlight: false,
     reviewRequested: null,
     reflecting: false,
+    rejectedProposals: 0,
     resolvingProposal: false,
     screenedTurns: 0,
     hits: 0,
@@ -110,6 +111,10 @@ const cfg = (key) => state.sessionOverrides[key] ?? config[key];
 
 // This extension's own tools, which are not agent activity worth counting.
 const OWN_TOOLS = new Set(["self_learn_now", "propose_skill"]);
+
+// A rejected proposal leaves the reflection open so the agent can correct it, so cap the attempts
+// to stop a confused agent from re-proposing all turn.
+const MAX_REJECTED_PROPOSALS = 3;
 
 // An extension's tools are offered to `task`-tool sub-agents as well as to the main agent, and
 // `self_learn_now`'s description reads to a sub-agent as an instruction to call it the moment its
@@ -889,6 +894,7 @@ function escalate(session, verdict, { forced = false } = {}) {
         return;
     }
     state.reflecting = true;
+    state.rejectedProposals = 0;
     debug(`escalating to main agent: ${verdict.target} "${verdict.skill}" (forced=${forced})`);
 
     // Deferred: sending from inside an event handler risks re-entering the agent loop.
@@ -1209,12 +1215,25 @@ const session = await joinSession({
                         resultType: "rejected",
                     };
                 }
-                state.reflecting = false;
-
                 if (args?.decline) {
+                    state.reflecting = false;
                     debug(`agent declined to propose: ${args?.reason ?? "(no reason)"}`);
                     return "Noted — nothing recorded.";
                 }
+
+                // A rejection below returns guidance that is useless if the retry is refused, so
+                // the reflection stays open. `session.idle` clears the flag when the turn ends.
+                const reject = (message) => {
+                    debug(`rejected proposal: ${message}`);
+                    if (++state.rejectedProposals >= MAX_REJECTED_PROPOSALS) {
+                        state.reflecting = false;
+                        return {
+                            textResultForLlm: `${message} No attempts left — stop and move on.`,
+                            resultType: "failure",
+                        };
+                    }
+                    return { textResultForLlm: message, resultType: "failure" };
+                };
 
                 const proposal = {
                     mode: args?.mode === "refine" ? "refine" : "new",
@@ -1224,10 +1243,7 @@ const session = await joinSession({
                 };
 
                 const problem = validateProposal(proposal);
-                if (problem) {
-                    debug(`rejected proposal: ${problem}`);
-                    return { textResultForLlm: `Proposal rejected: ${problem}`, resultType: "failure" };
-                }
+                if (problem) return reject(`Proposal rejected: ${problem}`);
 
                 // A refine must name a skill that actually exists. Otherwise "refine" silently
                 // degrades into creating a new skill under a name the user may not expect.
@@ -1240,15 +1256,12 @@ const session = await joinSession({
                 }
 
                 if (proposal.mode === "refine" && !existing) {
-                    debug(`rejected refine of unknown skill "${proposal.name}"`);
-                    return {
-                        textResultForLlm:
-                            `No skill named "${proposal.name}" exists, so it cannot be refined. ` +
+                    return reject(
+                        `No skill named "${proposal.name}" exists, so it cannot be refined. ` +
                             `Either use mode "new" with a name that reflects the lesson's own ` +
                             `subject, or decline if the lesson belongs in an existing skill you ` +
                             `have not named correctly.`,
-                        resultType: "failure",
-                    };
+                    );
                 }
 
                 // Fail here rather than at approval, so the agent can still choose a new name.
@@ -1256,18 +1269,16 @@ const session = await joinSession({
                     await resolveSkillFile(session, proposal.name, { mode: proposal.mode });
                 } catch (err) {
                     const reason = err?.message ?? String(err);
-                    debug(`rejected proposal: ${reason}`);
-                    return {
-                        textResultForLlm:
-                            `${reason} Propose a new personal skill instead, named for the ` +
+                    return reject(
+                        `${reason} Propose a new personal skill instead, named for the ` +
                             `lesson's own subject.`,
-                        resultType: "failure",
-                    };
+                    );
                 }
 
                 // Refining a disabled skill would silently have no effect; surface it at approval.
                 proposal.targetDisabled = existing ? existing.enabled === false : false;
 
+                state.reflecting = false;
                 proposal.deferred = false;
                 state.pendingProposal = proposal;
                 persistPendingProposal(session);
