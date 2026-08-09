@@ -602,18 +602,18 @@ function looksLikeVerdict(text) {
 }
 
 // `startAgent` returns a task id ("self-learn"), but the event log tags that agent's events with
-// an internal id ("bg-<uuid>"), so the two cannot be compared directly. Identity is established
-// the same way `readReplyFromEventLog` does it — off `subagent.started` — and the watch is
-// installed before the agent starts so no start event can arrive ahead of it.
-function noteScreenerStarted(event) {
+// an internal id ("bg-<uuid>"), so the two cannot be compared directly. Nor does the event carry
+// the description passed to `startAgent`: `subagent.started` reports the agent *type's* metadata
+// (agentName "explore", agentDescription "Fast codebase exploration…"), which is why the
+// description match in `readReplyFromEventLog` never fires and it falls through to its model
+// check. The screener's own prompt is the one field only this extension could have produced, so
+// identity is taken from the sub-agent's first `user.message`. The watch is installed before the
+// agent starts, since that message can land while the task id is still in flight.
+function noteScreenerPrompt(event) {
     const watch = screenerWatch;
     if (!watch || watch.eventAgentId || !event?.agentId) return;
-
-    const d = event?.data ?? {};
-    const mine =
-        d.agentDescription === SCREENER_DESCRIPTION ||
-        (!d.agentDescription && d.model && d.model === cfg("screenerModel"));
-    if (!mine) return;
+    const content = event?.data?.content;
+    if (typeof content !== "string" || !content.startsWith(watch.promptHead)) return;
 
     watch.eventAgentId = event.agentId;
     debug(`screener event id ${event.agentId} (task id ${watch.agentId ?? "pending"})`);
@@ -621,9 +621,8 @@ function noteScreenerStarted(event) {
 
 function noteScreenerMessage(event) {
     const watch = screenerWatch;
-    if (!watch || !event?.agentId) return;
-    if (event.agentId !== watch.eventAgentId && event.agentId !== watch.agentId) return;
-    if (!watch.agentId) return;
+    if (!watch || !watch.agentId || !event?.agentId) return;
+    if (event.agentId !== watch.eventAgentId) return;
     const content = event?.data?.content;
     if (!looksLikeVerdict(content)) return;
     screenerWatch = null;
@@ -651,6 +650,7 @@ async function runScreener(session, prompt) {
     const watch = {
         agentId: null,
         eventAgentId: null,
+        promptHead: prompt.slice(0, 160),
         onVerdict: (content) => {
             earlyReply = content;
             // Cancel before awaiting anything, so the agent cannot settle in the gap.
@@ -745,7 +745,16 @@ async function runScreener(session, prompt) {
         }
         throw new Error(`screener timed out after ${cfg("timeoutMs")}ms`);
     } finally {
-        if (screenerWatch?.agentId === agentId) screenerWatch = null;
+        if (screenerWatch === watch) {
+            // Two failed live runs were each diagnosed only after the fact. If identity was never
+            // resolved, record which sub-agent events actually arrived, so the next failure is
+            // self-explanatory instead of costing another run.
+            if (!watch.eventAgentId) {
+                const sub = [...deliveredTypes.keys()].filter((k) => k.endsWith("@sub"));
+                debug(`screener never identified in the event stream; sub-agent types seen: ${sub.join(", ") || "none"}`);
+            }
+            screenerWatch = null;
+        }
         await disposeTask(rpc, agentId, cancelledEarly);
     }
 }
@@ -1554,7 +1563,7 @@ session.on((event) => {
     const key = `${event?.type}${event?.agentId ? "@sub" : ""}`;
     deliveredTypes.set(key, (deliveredTypes.get(key) ?? 0) + 1);
     if (event?.type === "external_tool.requested") noteSubAgentToolCall(event);
-    if (event?.type === "subagent.started") noteScreenerStarted(event);
+    if (event?.type === "user.message") noteScreenerPrompt(event);
     if (event?.type === "assistant.message") noteScreenerMessage(event);
     if (event?.type === "hook.start") noteHookStart(event);
     if (event?.type === "hook.end") noteHookEnd(event);
