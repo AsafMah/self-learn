@@ -572,6 +572,44 @@ function sanitize(text, limit) {
 // Mirrors the advisor's recovery path: `tasks.list()` never populates `result` for a sub-agent
 // that parks in "idle", and the reported toolCallId is a stub for RPC-started agents, so the
 // reply is correlated through `subagent.started` after a pre-recorded event baseline.
+//
+// The screener is cancelled the moment its verdict arrives rather than left to settle, because
+// the CLI notifies the MAIN agent whenever a background agent completes or goes idle — telling it
+// to `read_agent` a task this extension owns and is about to remove, which surfaced to the user as
+// "read self learn agent failed". The task registry's completion callback returns early for a
+// cancelled task, so cancelling first suppresses the notification at its source. There is no
+// option on `tasks.startAgent` to opt out.
+//
+// The window is wide: across 61 recorded runs the verdict message preceded `subagent.completed`
+// by 1.6-4.8s (median ~2.0s), and this cancels within milliseconds of an event already delivered
+// live. Losing the race costs only the notification, since the polling path below still returns
+// the same reply.
+let screenerWatch = null;
+
+// Accepts exactly what `parseVerdict` accepts, so the screener is never cut off on a message the
+// parser would then reject.
+function looksLikeVerdict(text) {
+    if (typeof text !== "string") return false;
+    for (const candidate of extractJsonObjects(text)) {
+        try {
+            const obj = JSON.parse(candidate);
+            if (obj && typeof obj === "object" && obj.criteria) return true;
+        } catch {
+            // Keep looking for a well-formed object.
+        }
+    }
+    return false;
+}
+
+function noteScreenerMessage(event) {
+    const watch = screenerWatch;
+    if (!watch || event?.agentId !== watch.agentId) return;
+    const content = event?.data?.content;
+    if (!looksLikeVerdict(content)) return;
+    screenerWatch = null;
+    watch.onVerdict(content);
+}
+
 async function runScreener(session, prompt) {
     const rpc = session.rpc;
     if (!rpc?.tasks?.startAgent) throw new Error("session.rpc.tasks.startAgent unavailable");
@@ -592,13 +630,43 @@ async function runScreener(session, prompt) {
     });
     debug(`screener ${agentId} started on ${cfg("screenerModel")} (baseline ${baseline})`);
 
+    let earlyReply = null;
+    let cancelledEarly = false;
+    let signalEarly;
+    const earlyVerdict = new Promise((resolve) => {
+        signalEarly = resolve;
+    });
+    screenerWatch = {
+        agentId,
+        onVerdict: (content) => {
+            earlyReply = content;
+            // Cancel before awaiting anything, so the agent cannot settle in the gap.
+            rpc.tasks
+                .cancel({ id: agentId })
+                .then((result) => {
+                    cancelledEarly = result?.cancelled === true;
+                    debug(
+                        cancelledEarly
+                            ? `screener ${agentId} cancelled on verdict (notification suppressed)`
+                            : `screener ${agentId} settled before cancel — notification will fire`,
+                    );
+                })
+                .catch((err) => debug(`cancel-on-verdict failed: ${err?.message ?? err}`))
+                .finally(signalEarly);
+        },
+    };
+
     const deadline = Date.now() + cfg("timeoutMs");
     let seen = false;
     let emptySettledPolls = 0;
 
     try {
         while (Date.now() < deadline) {
-            await new Promise((r) => setTimeout(r, cfg("pollIntervalMs")));
+            await Promise.race([
+                earlyVerdict,
+                new Promise((r) => setTimeout(r, cfg("pollIntervalMs"))),
+            ]);
+            if (earlyReply) return earlyReply;
 
             let tasks = [];
             try {
@@ -615,7 +683,7 @@ async function runScreener(session, prompt) {
             seen = true;
 
             if (task.status === "failed") throw new Error(task.error || "screener failed");
-            if (task.status === "cancelled") return "";
+            if (task.status === "cancelled") return earlyReply ?? "";
 
             // Exact correlation: these are keyed by the task id we own, so unlike event-log
             // matching they cannot pick up another extension's or the main agent's sub-agent.
@@ -646,7 +714,8 @@ async function runScreener(session, prompt) {
         }
         throw new Error(`screener timed out after ${cfg("timeoutMs")}ms`);
     } finally {
-        await disposeTask(rpc, agentId);
+        if (screenerWatch?.agentId === agentId) screenerWatch = null;
+        await disposeTask(rpc, agentId, cancelledEarly);
     }
 }
 
@@ -686,12 +755,27 @@ async function readReplyFromEventLog(session, baseline) {
     return { status: "done", reply: replies[replies.length - 1] ?? "" };
 }
 
-async function disposeTask(rpc, agentId) {
-    try {
-        await rpc.tasks.cancel({ id: agentId });
-    } catch {
-        // Already settled.
+// Removal is conditional on the cancel actually winning. A task that settled on its own has
+// already made the CLI notify the main agent to `read_agent` it, and removing it is exactly what
+// turned that notification into "read self learn agent failed". Left in place the read resolves,
+// and the CLI drops the entry itself once the notification is consumed.
+async function disposeTask(rpc, agentId, alreadyCancelled = false) {
+    let cancelled = alreadyCancelled;
+
+    if (!cancelled) {
+        try {
+            const result = await rpc.tasks.cancel({ id: agentId });
+            cancelled = result?.cancelled === true;
+        } catch {
+            // Already settled.
+        }
     }
+
+    if (!cancelled) {
+        debug(`screener ${agentId} settled before cancel — left readable for the notification`);
+        return;
+    }
+
     try {
         await rpc.tasks.remove({ id: agentId });
     } catch {
@@ -1439,6 +1523,7 @@ session.on((event) => {
     const key = `${event?.type}${event?.agentId ? "@sub" : ""}`;
     deliveredTypes.set(key, (deliveredTypes.get(key) ?? 0) + 1);
     if (event?.type === "external_tool.requested") noteSubAgentToolCall(event);
+    if (event?.type === "assistant.message") noteScreenerMessage(event);
     if (event?.type === "hook.start") noteHookStart(event);
     if (event?.type === "hook.end") noteHookEnd(event);
     if (event?.type === "tool.execution_start") {
