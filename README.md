@@ -330,7 +330,9 @@ the **main agent's** notification stream ("agent *N* has finished processing and
 `read_agent` cannot resolve them. The CLI appears to have begun tracking extension-spawned agents in
 the session's background-agent registry, which would plausibly leave the tool call's bookkeeping
 waiting on an agent the extension has already disposed of. That last step is inference, not
-measurement — the request id never appears in any `~/.copilot/logs/process-*.log`.
+measurement — the request id never appears in any `~/.copilot/logs/process-*.log`. The
+notification half of that symptom is now addressed on its own terms; see *Cancelling the screener*
+below.
 
 **Workaround.** `self_learn_now action:"review"` no longer screens. It sets `state.reviewRequested`
 and returns immediately; `session.idle` runs the screen once the turn has ended and escalates
@@ -376,6 +378,57 @@ one whose dialog could not be shown at the time.
 Note this is the opposite constraint to the review hang above: a **sub-agent** must not be started
 inside a tool handler, while an **elicitation** must be raised inside one.
 
+## Cancelling the screener to keep it out of the main agent's context
+
+The screener is a real background agent, so the CLI announced each one to the **main** agent as
+"agent has finished". The main agent would then call `read_agent` on it and get *read self learn
+agent failed*, because `runScreener` had already removed the task. The user saw the error; the
+agent, correctly, concluded no such agent existed.
+
+`startAgent` has no way to opt out. `TasksStartAgentRequest` is `{agentType, prompt, name,
+description?, model?}` — there is no quiet flag. But the CLI's own completion callback has three
+early exits, and one is reachable from an extension:
+
+```js
+if (s.status === "cancelled") { ...; return }              // ← no notification
+if (s.factoryRunId === void 0 && !s.activeBlockingReads) { sendBackgroundAgentCompletionNotification(s) }
+```
+
+`factoryRunId` and `activeBlockingReads` are CLI-internal. Cancellation is not. So the screener is
+now cancelled the moment its verdict is parseable, rather than being left to finish and announce
+itself. Across 61 recorded runs the verdict message precedes `subagent.completed` by 1.6–4.8 s
+(median ~2.0 s), so the window is comfortable rather than a race worth being clever about.
+
+**Identity is the hard part, and cost two failed runs.** There are two id namespaces:
+`startAgent` returns a *task* id derived from `name` (`self-learn-1`), while the event log tags the
+same agent `bg-<uuid>`. They are never equal, and `cancel`/`remove` accept only the former.
+Correlation therefore has to come from the events, and `subagent.started` turned out to carry the
+agent **type's** metadata, not ours:
+
+```
+agentName        = explore
+agentDisplayName = Explore Agent
+agentDescription = Fast codebase exploration and answering questions...
+```
+
+The `description` passed to `startAgent` appears nowhere in the event, so matching on
+`"Self-learn screening"` could never have worked. (The same dead match exists in
+`readReplyFromEventLog`, which has always fallen through to its model check.) What remains —
+`agentName` and `model` — is shared with the main agent's own `explore` sub-agents, and latching
+onto a stranger would cancel our screener early and read someone else's message as the verdict.
+
+The prompt is the one field only this extension could have produced, so identity comes from the
+sub-agent's first `user.message` matching the head of the prompt just sent.
+
+**Losing the race must stay harmless.** If completion wins, cancelling returns `{cancelled: false}`
+and removal is skipped, because removal is exactly what invalidated the notification's attached
+read in the first place. A lost race degrades to the old behaviour — one stray notification — not
+to an error.
+
+Verified live: `screener event id bg-ad286f0f-… (task id self-learn-1)` followed by `screener
+cancelled on verdict (notification suppressed)`, and no completion notification reached the main
+agent on that turn.
+
 ## Known limitations
 
 - **Contention with `advisor`.** `session.idle` is deferred while background work is pending. An
@@ -388,7 +441,8 @@ inside a tool handler, while an **elicitation** must be raised inside one.
   ask for**. Deferring the approval dialog does not hide that.
 - `startAgent` accepts a `model` but no reasoning-effort override, so the screener runs at its
   model's default effort.
-- Every screening emits an "agent finished" system notification into the main agent's context.
+- A screening whose verdict arrives too late to cancel still emits one "agent finished"
+  notification into the main agent's context.
 - The extension loads per session, so several sessions screen independently.
 - **Extension slash commands do not appear in the GitHub Copilot app**, only in the CLI's TUI.
   The `self_learn_now` tool exists to cover that gap.
