@@ -601,9 +601,29 @@ function looksLikeVerdict(text) {
     return false;
 }
 
+// `startAgent` returns a task id ("self-learn"), but the event log tags that agent's events with
+// an internal id ("bg-<uuid>"), so the two cannot be compared directly. Identity is established
+// the same way `readReplyFromEventLog` does it — off `subagent.started` — and the watch is
+// installed before the agent starts so no start event can arrive ahead of it.
+function noteScreenerStarted(event) {
+    const watch = screenerWatch;
+    if (!watch || watch.eventAgentId || !event?.agentId) return;
+
+    const d = event?.data ?? {};
+    const mine =
+        d.agentDescription === SCREENER_DESCRIPTION ||
+        (!d.agentDescription && d.model && d.model === cfg("screenerModel"));
+    if (!mine) return;
+
+    watch.eventAgentId = event.agentId;
+    debug(`screener event id ${event.agentId} (task id ${watch.agentId ?? "pending"})`);
+}
+
 function noteScreenerMessage(event) {
     const watch = screenerWatch;
-    if (!watch || event?.agentId !== watch.agentId) return;
+    if (!watch || !event?.agentId) return;
+    if (event.agentId !== watch.eventAgentId && event.agentId !== watch.agentId) return;
+    if (!watch.agentId) return;
     const content = event?.data?.content;
     if (!looksLikeVerdict(content)) return;
     screenerWatch = null;
@@ -621,40 +641,51 @@ async function runScreener(session, prompt) {
         baseline = 0;
     }
 
-    const { agentId } = await rpc.tasks.startAgent({
-        agentType: cfg("agentType"),
-        prompt,
-        name: "self-learn",
-        description: SCREENER_DESCRIPTION,
-        model: cfg("screenerModel"),
-    });
-    debug(`screener ${agentId} started on ${cfg("screenerModel")} (baseline ${baseline})`);
-
     let earlyReply = null;
     let cancelledEarly = false;
     let signalEarly;
     const earlyVerdict = new Promise((resolve) => {
         signalEarly = resolve;
     });
-    screenerWatch = {
-        agentId,
+
+    const watch = {
+        agentId: null,
+        eventAgentId: null,
         onVerdict: (content) => {
             earlyReply = content;
             // Cancel before awaiting anything, so the agent cannot settle in the gap.
             rpc.tasks
-                .cancel({ id: agentId })
+                .cancel({ id: watch.agentId })
                 .then((result) => {
                     cancelledEarly = result?.cancelled === true;
                     debug(
                         cancelledEarly
-                            ? `screener ${agentId} cancelled on verdict (notification suppressed)`
-                            : `screener ${agentId} settled before cancel — notification will fire`,
+                            ? `screener cancelled on verdict (notification suppressed)`
+                            : `screener settled before cancel — notification will fire`,
                     );
                 })
                 .catch((err) => debug(`cancel-on-verdict failed: ${err?.message ?? err}`))
                 .finally(signalEarly);
         },
     };
+    // Installed first: `subagent.started` can otherwise land before the id comes back.
+    screenerWatch = watch;
+
+    let agentId;
+    try {
+        ({ agentId } = await rpc.tasks.startAgent({
+            agentType: cfg("agentType"),
+            prompt,
+            name: "self-learn",
+            description: SCREENER_DESCRIPTION,
+            model: cfg("screenerModel"),
+        }));
+    } catch (err) {
+        screenerWatch = null;
+        throw err;
+    }
+    watch.agentId = agentId;
+    debug(`screener ${agentId} started on ${cfg("screenerModel")} (baseline ${baseline})`);
 
     const deadline = Date.now() + cfg("timeoutMs");
     let seen = false;
@@ -1523,6 +1554,7 @@ session.on((event) => {
     const key = `${event?.type}${event?.agentId ? "@sub" : ""}`;
     deliveredTypes.set(key, (deliveredTypes.get(key) ?? 0) + 1);
     if (event?.type === "external_tool.requested") noteSubAgentToolCall(event);
+    if (event?.type === "subagent.started") noteScreenerStarted(event);
     if (event?.type === "assistant.message") noteScreenerMessage(event);
     if (event?.type === "hook.start") noteHookStart(event);
     if (event?.type === "hook.end") noteHookEnd(event);
