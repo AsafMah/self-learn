@@ -121,9 +121,15 @@ canvas-authoring skill.
 ## Install
 
 ```powershell
+# Windows
 New-Item -ItemType Junction `
     -Path "$env:USERPROFILE\.copilot\extensions\self-learn" `
-    -Target "G:\copilot-plugins\self-learn"
+    -Target "C:\src\self-learn"
+```
+
+```bash
+# macOS / Linux
+ln -s ~/src/self-learn ~/.copilot/extensions/self-learn
 ```
 
 Then `/extensions reload`.
