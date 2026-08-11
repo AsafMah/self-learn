@@ -218,6 +218,29 @@ ln -s ~/src/self-learn ~/.copilot/extensions/self-learn
 
 Then `/extensions reload`.
 
+The whole directory has to be linked, not just `extension.mjs`: it imports `./lib.mjs`, which holds
+the pure core.
+
+### Tests
+
+```
+npm test
+```
+
+`node --test`, built into Node — the repo has no dependencies, which matters here because
+`node_modules` would otherwise appear inside a directory the CLI loads as an extension.
+
+`extension.mjs` ends with a top-level `await joinSession(...)`, so importing it from a test would
+try to connect to the host. Everything worth testing is therefore in `lib.mjs`, which touches no
+session, config, or disk: byte budgets are passed in rather than read from config. The tests cover
+what has real invariants — that the rubric cannot be talked past, that a quote is checked against
+the transcript, that writes cannot escape the skill directory, that frontmatter cannot be broken out
+of, and that repeated extends keep the previous file as an exact byte prefix.
+
+That last one is not decoration. The helpers were previously verified by extracting them from the
+source with string offsets, and the extraction was fragile enough that a real defect got through:
+`appendSection` re-added a leading newline every call, so a skill grew a blank line per extend.
+
 ## Configuration
 
 First match wins: `$COPILOT_SELF_LEARN_CONFIG`, `<cwd>/.github/self-learn.json`,
