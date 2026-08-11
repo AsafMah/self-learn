@@ -22,6 +22,7 @@ import {
     sanitize,
     parseVerdict,
     looksLikeVerdict,
+    referencedSkillNames,
     validateProposal,
     renderSkillFile,
     splitFrontmatter,
@@ -58,6 +59,8 @@ const DEFAULTS = {
     logToTimeline: true,
     debugLog: join(homedir(), ".copilot", "logs", "self-learn.log"),
     instructions: "",
+    // Extra instruction files to scan for skill names, beyond the standard locations.
+    instructionFiles: [],
 };
 
 // Absorbs the lag between a sub-agent reporting idle and its reply appearing in the event log.
@@ -378,10 +381,42 @@ async function buildTranscriptDelta(session, { lookback = 0 } = {}) {
     return text;
 }
 
+// Reads the user's instruction files and reports which installed skills they point at. The
+// matching rule itself lives in lib.mjs, where it is tested.
+function loadInstructionSkillNames(names) {
+    if (names.length === 0) return new Set();
+
+    const files = [
+        join(homedir(), ".copilot", "copilot-instructions.md"),
+        join(homedir(), ".github", "copilot-instructions.md"),
+        join(process.cwd(), ".github", "copilot-instructions.md"),
+        join(process.cwd(), "AGENTS.md"),
+        ...(cfg("instructionFiles") ?? []),
+    ];
+
+    let text = "";
+    for (const file of files) {
+        try {
+            if (existsSync(file)) text += "\n" + readFileSync(file, "utf8");
+        } catch {
+            // An unreadable instructions file just means no bias, which is the safe direction.
+        }
+    }
+
+    const referenced = referencedSkillNames(text, names);
+    if (referenced.size > 0) debug(`instruction-referenced skills: ${[...referenced].join(", ")}`);
+    return referenced;
+}
+
 async function listSkills(session) {
     try {
         const { skills } = await session.rpc.skills.list();
-        return skills.map((s) => ({ name: s.name, description: s.description }));
+        const referenced = loadInstructionSkillNames(skills.map((s) => s.name));
+        return skills.map((s) => ({
+            name: s.name,
+            description: s.description,
+            referenced: referenced.has(s.name),
+        }));
     } catch (err) {
         debug(`skills.list failed: ${err?.message ?? err}`);
         return [];
@@ -391,7 +426,12 @@ async function listSkills(session) {
 function buildScreenerPrompt(transcript, skills, declined = []) {
     const inventory =
         skills.length > 0
-            ? skills.map((s) => `- ${s.name}: ${s.description ?? ""}`).join("\n")
+            ? skills
+                  .map(
+                      (s) =>
+                          `- ${s.name}${s.referenced ? " [IN USER'S INSTRUCTIONS]" : ""}: ${s.description ?? ""}`,
+                  )
+                  .join("\n")
             : "(no skills installed)";
 
     const refused =
@@ -495,6 +535,14 @@ Respond with EXACTLY ONE JSON object and nothing else:
     since it rewrites the whole skill.
   - "new" — no skill above owns the subject. Give a short kebab-case name.
   Merely adjacent is not enough: mistargeting corrupts an unrelated skill.
+- Skills marked [IN USER'S INSTRUCTIONS] are named in the user's own instruction files, so the
+  agent is told they exist in every session. Unmarked skills are surfaced only when the runtime
+  judges them relevant, and a narrowly-scoped new skill is often never surfaced at all — measured
+  across this user's history, personal skills they had not named went essentially unused. Being
+  named is not a guarantee of use, but it is the difference between a lesson that can be found and
+  one that probably cannot. So when a lesson plausibly belongs to a marked skill, prefer "extend"
+  over creating a sibling that may never be read. This does NOT lower the bar: the lesson must
+  genuinely belong to that skill's subject, and a lesson that fits nowhere is still "new".
 - "rationale": under 400 chars, stating the lesson itself.\
 ${cfg("instructions") ? `\n\nAdditional instructions:\n${cfg("instructions")}` : ""}`;
 }

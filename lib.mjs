@@ -250,6 +250,35 @@ export function renderSkillFile(p) {
     return `---\nname: ${oneLine(p.name)}\ndescription: ${oneLine(p.description)}\n---\n\n${p.body.trim()}\n`;
 }
 
+// Which installed skills the user's own instructions point at.
+//
+// Measured, not assumed: across 411 recorded skill invocations, every personal skill with real
+// usage was one named in the user's instructions, while personal skills that were merely installed
+// sat at or near zero. Being named is not a guarantee of use — one named skill in that sample was
+// never invoked either, because its trigger simply never came up — but it does mean the agent is
+// told the skill exists in every session, whereas an unnamed skill depends on the runtime choosing
+// to surface it.
+//
+// A bare substring match is not enough: a skill called `review` or `commit` would match ordinary
+// prose. A backticked mention is how these lists are actually written, and an unbackticked mention
+// is trusted only for compound names, which are distinctive enough not to collide with prose.
+export function referencedSkillNames(text, names) {
+    const found = new Set();
+    if (typeof text !== "string" || text === "") return found;
+
+    for (const name of names) {
+        if (typeof name !== "string" || name === "") continue;
+        if (text.includes("`" + name + "`")) {
+            found.add(name);
+            continue;
+        }
+        if (!name.includes("-")) continue;
+        const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        if (new RegExp(`(^|[^\\w-])${escaped}([^\\w-]|$)`).test(text)) found.add(name);
+    }
+    return found;
+}
+
 export const headingKey = (s) => s.replace(/^#+\s*/, "").replace(/\s+/g, " ").trim().toLowerCase();
 
 export function splitFrontmatter(text) {

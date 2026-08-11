@@ -5,6 +5,7 @@ import {
     looksLikeVerdict,
     sanitize,
     normaliseSkillFilePath,
+    referencedSkillNames,
     validateProposal,
     renderSkillFile,
     splitFrontmatter,
@@ -168,6 +169,50 @@ test("body and files share one byte budget", () => {
 test("a file listed twice is refused", () => {
     const p = { ...base, files: [{ path: "s/a.ps1", content: "x" }, { path: "S/A.ps1", content: "y" }] };
     assert.match(validateProposal(p, LIMIT), /listed twice/);
+});
+
+// --- instruction references ------------------------------------------------
+
+const INSTRUCTIONS = [
+    "## Use the installed personal skills",
+    "",
+    "- `repository-ramp-up` — unfamiliar repository or subsystem.",
+    "- `safe-secret-fixtures` — tests involving token or credential-shaped values.",
+    "",
+    "## Engineering and review",
+    "",
+    "Review the change and commit it. Always sync before you review a pull request.",
+].join("\n");
+
+test("skills named in the instructions are recognised", () => {
+    const found = referencedSkillNames(INSTRUCTIONS, ["repository-ramp-up", "safe-secret-fixtures"]);
+    assert.deepEqual([...found].sort(), ["repository-ramp-up", "safe-secret-fixtures"]);
+});
+
+test("generic one-word skill names are not matched by ordinary prose", () => {
+    // The instructions above talk about review, commit and sync as English words. A plugin skill
+    // happens to be named each of those, and marking them would bias the screener toward
+    // extending skills the user never pointed at.
+    const found = referencedSkillNames(INSTRUCTIONS, ["review", "commit", "sync", "architect"]);
+    assert.deepEqual([...found], []);
+});
+
+test("a one-word skill name is recognised when explicitly backticked", () => {
+    assert.deepEqual([...referencedSkillNames("Use the `review` skill.", ["review"])], ["review"]);
+});
+
+test("a compound name is not matched inside a longer name", () => {
+    const found = referencedSkillNames("- `adversarial-code-review` — find defects.", ["code-review"]);
+    assert.deepEqual([...found], []);
+});
+
+test("an unnamed skill stays unmarked", () => {
+    assert.deepEqual([...referencedSkillNames(INSTRUCTIONS, ["gitignore-anchor-roots"])], []);
+});
+
+test("no instructions means no bias", () => {
+    assert.equal(referencedSkillNames("", ["repository-ramp-up"]).size, 0);
+    assert.equal(referencedSkillNames(undefined, ["repository-ramp-up"]).size, 0);
 });
 
 // --- rendering and appending ----------------------------------------------

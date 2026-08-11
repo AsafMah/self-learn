@@ -138,6 +138,40 @@ Two deliberate exceptions:
 The size cap is checked against the **assembled** file, not the new section, so a skill cannot grow
 past `maxSkillBytes` one acceptable-looking addition at a time.
 
+### Which skills actually get read
+
+The screener marks skills your instruction files name, and prefers extending those.
+
+This is measured, not assumed. Across 411 recorded skill invocations for one user, every personal
+skill with real usage was one their `copilot-instructions.md` named by hand:
+
+| Personal skill | Invocations | Named in instructions |
+| --- | --- | --- |
+| verification-before-completion | 21 | yes |
+| adversarial-code-review | 17 | yes |
+| kql-expert | 16 | yes |
+| repository-ramp-up | 13 | yes |
+| systematic-debugging | 9 | yes |
+| architecture-design | 7 | yes |
+| safe-secret-fixtures | 0 | yes — narrow trigger, never came up |
+| gitignore-anchor-roots | 0 | **no** |
+| install-python | 0 | **no** |
+
+The runtime's own skill list is filtered per session, so an unnamed skill is offered only when it is
+judged relevant — and a narrow one may never be. That makes a newly written narrow skill close to
+write-only. The same lesson appended to a skill the instructions already name is reachable
+immediately, which is the strongest argument for `extend` over `new`.
+
+Two honest limits. Being named does not guarantee use — `safe-secret-fixtures` proves that — so the
+marker reads `[IN USER'S INSTRUCTIONS]`, not "always loaded". And the unnamed skills are also
+narrower, so scope is a confound; the signal is suggestive, not conclusive.
+
+Instruction files scanned: `~/.copilot/copilot-instructions.md`, `~/.github/copilot-instructions.md`,
+`<cwd>/.github/copilot-instructions.md`, `<cwd>/AGENTS.md`, plus anything in `instructionFiles`.
+A name counts as referenced if it appears backticked, or — for compound names only — as a whole
+word. One-word skills like `review` or `commit` need the backticks, since otherwise any prose about
+reviewing or committing would mark them.
+
 ## Safety
 
 - A skill may ship **supporting files** beside `SKILL.md` — usually a script, since a check that
@@ -264,6 +298,7 @@ First match wins: `$COPILOT_SELF_LEARN_CONFIG`, `<cwd>/.github/self-learn.json`,
 | `logToTimeline` | `true` | Surface hits in the session timeline. |
 | `debugLog` | `~/.copilot/logs/self-learn.log` | Trace file. `null` disables. |
 | `instructions` | `""` | Extra project-specific screening instructions. |
+| `instructionFiles` | `[]` | Extra instruction files to scan for skill names, beyond the standard locations. |
 
 ## Commands and tools
 
