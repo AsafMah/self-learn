@@ -71,8 +71,49 @@ safe here is cheap: rejection means no skill, and the review can simply be run a
 Rejections report which criteria failed, e.g. `failed: surprising, expensive, undiscoverable,
 uncovered`, which is what makes the bar tunable rather than mysterious.
 
+### Refusals are remembered
+
+Turning a proposal down used to leave no trace. The screener's only sense of what is already
+covered is the list of **installed** skills, so a refused lesson stayed invisible, passed
+`uncovered` again the next time similar work happened, and could come back indefinitely.
+
+Refusals now go to `~/.copilot/self-learn/declined.json`, which the screener is shown. It lives
+outside any workspace deliberately: the case that actually bites is the same lesson resurfacing in
+a *different* repo weeks later, which a per-workspace file would never see.
+
+It is context for the screener, not a block in code, because a refusal is ambiguous — it can mean
+"bad draft" or "bad subject". A materially different lesson still passes. The two sources are
+weighted differently:
+
+| Refused by | Treated as |
+| --- | --- |
+| the user | binding — raise it again only if it is a genuinely different lesson |
+| the agent | a strong prior the transcript can overcome if the lesson is now better supported |
+
+Agent declines are recorded because otherwise the screener reaches the same verdict next time and
+spends another unrequested escalation turn on it. Repeat refusals of one name are counted rather
+than duplicated, and the count is what the screener weighs.
+
+`self_learn_now action:"declines"` lists the ledger and names the file, so a refusal recorded in
+error can be undone.
+
 ## Safety
 
+- A skill may ship **supporting files** beside `SKILL.md` — usually a script, since a check that
+  can be *run* is worth more than a paragraph describing the check. This is the one path by which
+  the extension writes executable content, so it is fenced in on both sides:
+  - Paths must be relative and at most three levels deep, and every segment must match
+    `^[A-Za-z0-9][A-Za-z0-9._-]*$`. Starting alphanumeric rules out `..`, `.` and dotfiles in one
+    test rather than by enumerating cases; drive letters, UNC prefixes, leading `/`, duplicate
+    paths and `SKILL.md` itself are rejected separately.
+  - The resolved path is re-checked against the skill's own directory immediately before writing,
+    because a proposal can be persisted, edited on disk, and restored between validation and use.
+  - Body and files share one byte budget, so splitting content across files cannot evade
+    `maxSkillBytes`.
+  - The approval dialog **shows the file contents**, not just their names, and says plainly that a
+    future agent may run them. Truncation is marked so nothing goes silently unseen.
+  - Files are added or overwritten; an existing file the proposal does not list is left alone.
+    Nothing is ever deleted.
 - The agent **cannot write skills itself** — it submits a draft through `propose_skill`, and the
   extension writes only after explicit approval.
 - **Writes never leave the personal skills root.** New skills are created under it; a `refine`
@@ -89,7 +130,7 @@ uncovered`, which is what makes the bar tunable rather than mysterious.
   inject extra YAML keys or terminate the block.
 - Any existing `SKILL.md` is copied to `SKILL.md.bak` before being replaced — keyed on the file
   existing, not on the declared mode, so a `new` proposal colliding with an existing skill is
-  still recoverable and is labelled as an overwrite.
+  still recoverable and is labelled as an overwrite. Supporting files are backed up the same way.
 - The approval dialog shows the exact file to be written.
 - The user's hand-written `~/.copilot/copilot-instructions.md` is never touched.
 - Refining a skill that is **disabled** in settings is detected and surfaced in the approval
@@ -170,6 +211,7 @@ both surfaces.
 | `self_learn_now` (`action: "status"`) | Counters and pending-proposal state. |
 | `self_learn_now` (`action: "discard"`) | Drop the pending proposal without writing it. |
 | `self_learn_now` (`action: "events"`) | Which session event types have actually been delivered. |
+| `self_learn_now` (`action: "declines"`) | Lessons already refused, and the ledger's path. |
 | `propose_skill` | Used by the agent to submit a draft. Rejected outside a reflection. |
 
 In the CLI TUI these are also available as slash commands:

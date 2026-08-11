@@ -397,11 +397,12 @@ function buildScreenerPrompt(transcript, skills, declined = []) {
             ? declined
                   .slice()
                   .reverse()
-                  .map(
-                      (d) =>
-                          `- ${d.name} (refused by ${d.by === "user" ? "the user" : "the agent"}` +
-                          `${(d.times ?? 1) > 1 ? `, ${d.times} times` : ""}): ${d.why || "(no reason recorded)"}`,
-                  )
+                  .map((d) => {
+                      const who = d.by === "user" ? "the user" : "the agent";
+                      const repeat = (d.times ?? 1) > 1 ? `, ${d.times} times` : "";
+                      return `- ${d.name} (refused by ${who}${repeat}): ` +
+                          `${d.why || "(no reason recorded)"}`;
+                  })
                   .join("\n")
             : "(nothing has been refused yet)";
 
@@ -927,6 +928,81 @@ async function screen(session, { force = false, lookback = 0 } = {}) {
 
 const SKILL_NAME_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
+// A skill may ship supporting files beside SKILL.md — most usefully a script, since a check that
+// can be RUN is worth more than a paragraph describing the check. These are written into the
+// skill's own directory and nowhere else.
+//
+// Each segment must start alphanumeric, which rules out `..`, `.`, and dotfiles in one test
+// rather than by enumerating the cases to reject.
+const SKILL_FILE_SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const MAX_SKILL_FILES = 10;
+const MAX_SKILL_FILE_DEPTH = 3;
+
+// Rejects anything that is not a plain relative path inside the skill directory, and returns the
+// path in normalised form. Callers still re-check the resolved path against the directory before
+// writing: this is a filter on what the agent may ask for, not the last line of defence.
+function normaliseSkillFilePath(raw) {
+    if (typeof raw !== "string" || raw.trim() === "") return { error: "file path missing" };
+    const path = raw.trim().replace(/\\/g, "/");
+
+    if (path.startsWith("/") || /^[A-Za-z]:/.test(path)) {
+        return { error: `"${raw}" must be relative to the skill directory` };
+    }
+    if (/^SKILL\.md$/i.test(path)) {
+        return { error: `SKILL.md is written from "body", not from "files"` };
+    }
+
+    const segments = path.split("/").filter((s) => s !== "");
+    if (segments.length === 0) return { error: `"${raw}" is not a usable path` };
+    if (segments.length > MAX_SKILL_FILE_DEPTH) {
+        return { error: `"${raw}" is nested deeper than ${MAX_SKILL_FILE_DEPTH} levels` };
+    }
+    for (const segment of segments) {
+        if (!SKILL_FILE_SEGMENT_RE.test(segment)) {
+            return { error: `"${raw}" contains an unusable path segment "${segment}"` };
+        }
+    }
+    return { path: segments.join("/") };
+}
+
+function validateSkillFiles(p) {
+    if (p.files === undefined || p.files === null) {
+        p.files = [];
+        return null;
+    }
+    if (!Array.isArray(p.files)) return "files must be an array";
+    if (p.files.length > MAX_SKILL_FILES) {
+        return `too many files (${p.files.length} > ${MAX_SKILL_FILES})`;
+    }
+
+    const seen = new Set();
+    const normalised = [];
+    for (const entry of p.files) {
+        if (!entry || typeof entry !== "object") return "each file needs a path and content";
+        const { path, error } = normaliseSkillFilePath(entry.path);
+        if (error) return error;
+        if (typeof entry.content !== "string") return `"${path}" has no content`;
+
+        const key = path.toLowerCase();
+        if (seen.has(key)) return `"${path}" is listed twice`;
+        seen.add(key);
+        normalised.push({ path, content: entry.content });
+    }
+
+    // Budgeted together with the body: what matters is the total a future session pays to load
+    // the skill, not how it was split across files.
+    const total = normalised.reduce(
+        (n, f) => n + Buffer.byteLength(f.content, "utf8"),
+        Buffer.byteLength(p.body ?? "", "utf8"),
+    );
+    if (total > cfg("maxSkillBytes")) {
+        return `body and files total ${total} bytes, over maxSkillBytes (${cfg("maxSkillBytes")})`;
+    }
+
+    p.files = normalised;
+    return null;
+}
+
 // Derive the skills directory from the runtime's own reported paths rather than hardcoding it,
 // falling back to the documented personal location.
 async function resolveSkillsRoot(session) {
@@ -954,7 +1030,7 @@ function validateProposal(p) {
         return `body exceeds maxSkillBytes (${cfg("maxSkillBytes")})`;
     }
     if (p.mode !== "new" && p.mode !== "refine") return `invalid mode "${p.mode}"`;
-    return null;
+    return validateSkillFiles(p);
 }
 
 function renderSkillFile(p) {
@@ -1010,14 +1086,30 @@ async function writeSkill(session, p) {
 
     // Keyed on existence, not on the declared mode: a proposal claiming mode "new" whose name
     // collides with an existing skill would otherwise destroy a hand-written file with no backup.
-    if (existed) {
-        copyFileSync(file, `${file}.bak`);
-        debug(`backed up ${file} -> ${file}.bak`);
-    }
+    const backup = (target) => {
+        if (!existsSync(target)) return;
+        copyFileSync(target, `${target}.bak`);
+        debug(`backed up ${target} -> ${target}.bak`);
+    };
 
+    backup(file);
     mkdirSync(dir, { recursive: true });
     writeFileSync(file, renderSkillFile(p), "utf8");
     debug(`wrote ${file} (mode=${p.mode}, existed=${existed})`);
+
+    const dirWithSep = dir.endsWith(sep) ? dir : dir + sep;
+    for (const f of p.files ?? []) {
+        // Re-checked against the resolved directory rather than trusted from validation: this
+        // proposal may have been persisted, edited on disk, and restored since it was validated.
+        const target = resolve(join(dir, f.path));
+        if (!target.startsWith(dirWithSep)) {
+            throw new Error(`refusing to write outside the skill directory: ${target}`);
+        }
+        backup(target);
+        mkdirSync(dirname(target), { recursive: true });
+        writeFileSync(target, f.content, "utf8");
+        debug(`wrote ${target} (${Buffer.byteLength(f.content, "utf8")} bytes)`);
+    }
 
     try {
         await session.rpc.skills.reload();
@@ -1043,6 +1135,12 @@ ${target}
 
 Write the lesson so it will be useful in a FUTURE, UNRELATED session: state the trap and the \
 reliable technique, not the specifics of this task. Be concise and concrete.
+
+If any part of it can be executed rather than described — a check that proves the condition, a \
+command sequence that is easy to get wrong — ship that as a file alongside the skill via \`files\` \
+and reference it from the body. A future agent can run a script; it can only re-derive a \
+paragraph. Include ONLY a script you actually ran in this session and saw work: an untested \
+script is worse than none, because it will be trusted.
 
 When the draft is ready, call the \`propose_skill\` tool with it. Do NOT write any file yourself — \
 the extension handles writing after the user approves. Then stop; a one-line summary is enough. \
@@ -1130,6 +1228,27 @@ async function resolvePendingProposal(session) {
 take effect until you re-enable it.`
             : "";
         const backupNote = exists ? "\nThe previous version is kept as SKILL.md.bak." : "";
+        // The user is approving files a future session may EXECUTE, so they are shown rather than
+        // merely counted, and any truncation is marked so nothing goes silently unseen. A
+        // four-backtick fence survives content that itself contains a normal fence.
+        const files = p.files ?? [];
+        const shown = files.slice(0, 4);
+        const filesNote =
+            files.length === 0
+                ? ""
+                : `\n\nIt also writes ${files.length} file(s) into the skill folder. ` +
+                  `A future agent may RUN these:\n\n` +
+                  shown
+                      .map((f) => {
+                          const size = Buffer.byteLength(f.content, "utf8");
+                          const shownText = truncate(f.content, 500);
+                          const cut = shownText.length < f.content.length ? "\n[truncated]" : "";
+                          return `\`${f.path}\` (${size} bytes)\n\n\`\`\`\`\n${shownText}${cut}\n\`\`\`\``;
+                      })
+                      .join("\n\n") +
+                  (files.length > shown.length
+                      ? `\n\nNot shown: ${files.slice(shown.length).map((f) => `\`${f.path}\``).join(", ")}`
+                      : "");
         // Surfaced because a refine of a skill installed elsewhere writes outside the personal
         // skills directory, and a mistargeted refine would otherwise be invisible until too late.
         // The dialog body is rendered as markdown, and CommonMark treats a backslash before ASCII
@@ -1140,7 +1259,7 @@ take effect until you re-enable it.`
 
         const message = `self-learn wants to ${where}.\n\n${p.description}\n\n\
 ${closeOpenFence(truncate(p.body, 800))}\
-${backupNote}${pathNote}${disabledNote}\n\nWrite it?`;
+${filesNote}${backupNote}${pathNote}${disabledNote}\n\nWrite it?`;
 
         let approved = false;
         try {
@@ -1437,6 +1556,28 @@ const session = await joinSession({
                             "Complete markdown body, without frontmatter. For mode=refine this " +
                             "must be the full updated content, not a fragment.",
                     },
+                    files: {
+                        type: "array",
+                        description:
+                            "Optional supporting files written beside SKILL.md, for when the " +
+                            "lesson is better carried by something runnable than by prose — a " +
+                            "script that performs the fiddly step, or checks the condition. " +
+                            "Reference them from the body. Files are added or overwritten; any " +
+                            "existing file you do not list is left untouched.",
+                        items: {
+                            type: "object",
+                            properties: {
+                                path: {
+                                    type: "string",
+                                    description:
+                                        "Relative path inside the skill folder, e.g. " +
+                                        "\"scripts/check.ps1\". Cannot be SKILL.md.",
+                                },
+                                content: { type: "string", description: "Full file contents." },
+                            },
+                            required: ["path", "content"],
+                        },
+                    },
                 },
                 required: [],
             },
@@ -1486,6 +1627,7 @@ const session = await joinSession({
                     name: (args?.name ?? "").trim(),
                     description: (args?.description ?? "").trim(),
                     body: args?.body ?? "",
+                    files: args?.files,
                     // Carried on the proposal rather than read from state at approval time: the
                     // dialog can outlive a reload, and the ledger entry is far more useful for
                     // judging similarity when it says what the lesson WAS.
