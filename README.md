@@ -57,7 +57,7 @@ extension computes the outcome — so it cannot reach "worth learning" by assert
 | `expensive` | Not knowing it demonstrably cost something in this transcript. |
 | `undiscoverable` | Could not have been found in the obvious docs or type definitions. |
 | `transferable` | Applies to a future session on a different task. |
-| `uncovered` | No existing skill already addresses the subject. |
+| `uncovered` | No existing skill already says this. Same subject, new case passes — see below. |
 
 All five must pass. `expensive` additionally requires a **verbatim quote from the transcript**,
 at least 24 characters, which the extension checks against the transcript it actually sent. An
@@ -97,6 +97,47 @@ than duplicated, and the count is what the screener weighs.
 `self_learn_now action:"declines"` lists the ledger and names the file, so a refusal recorded in
 error can be undone.
 
+### Skills that grow: `extend`
+
+A skill is retrieved by its one-line `description` and then loaded **whole**. That single fact
+decides the shape of everything here. Splitting one subject across five narrow skills means five
+descriptions competing to be matched, five entries in the list every session pays for, and
+interlocking lessons that only help if they happen to arrive together. So a lesson about a subject
+an existing skill already owns is better added *to* that skill than filed beside it.
+
+Criterion 5 therefore passes when a skill covers the same subject but not yet this case. The
+screener returns a `target`:
+
+| `target` | Means |
+| --- | --- |
+| `new` | nothing covers this subject yet |
+| `refine` | an existing skill says something and it is **wrong** |
+| `extend` | an existing skill is right, and this is a case it does not cover |
+
+`extend` exists rather than reusing `refine` because of how they differ mechanically, not
+stylistically. `refine` requires the model to reproduce the entire body; every reproduction is a
+chance to silently drop an earlier lesson, and the only evidence is a `.bak` nobody reads. Over a
+dozen growths that erosion is close to certain. Under `extend` **no model ever emits the existing
+text**: the agent writes only the new section, and the extension appends it. The prior bytes are
+carried across in code, so accumulation cannot erode.
+
+The invariant is tested directly — after repeated growth the previous file is an exact byte prefix
+of the new one. (Writing this caught a real defect: the frontmatter parser leaves a leading newline
+behind, which was being re-added on every append and would have grown a blank line per extend.)
+
+Two deliberate exceptions:
+
+- **The `description` may broaden.** An umbrella that accretes cases its description never
+  mentions stops being retrieved, which would defeat the point. It changes only when explicitly
+  supplied, and the dialog shows it as a `from:` / `to:` diff, so widening is something the user
+  approves rather than something that happens quietly.
+- **A duplicate section heading is refused**, case-insensitively, with nothing written. Two
+  sections with one title is how a skill starts contradicting itself; if the existing section is
+  wrong, that is what `refine` is for.
+
+The size cap is checked against the **assembled** file, not the new section, so a skill cannot grow
+past `maxSkillBytes` one acceptable-looking addition at a time.
+
 ## Safety
 
 - A skill may ship **supporting files** beside `SKILL.md` — usually a script, since a check that
@@ -116,16 +157,18 @@ error can be undone.
     Nothing is ever deleted.
 - The agent **cannot write skills itself** — it submits a draft through `propose_skill`, and the
   extension writes only after explicit approval.
-- **Writes never leave the personal skills root.** New skills are created under it; a `refine`
-  resolves the target's actual path from `rpc.skills.list()` and is **rejected** if that path
-  lies outside the root. Plugin and bundled skills live in caches and install directories that
+- **Writes never leave the personal skills root.** New skills are created under it; a `refine` or
+  `extend` resolves the target's actual path from `rpc.skills.list()` and is **rejected** if that
+  path lies outside the root. Plugin and bundled skills live in caches and install directories that
   updates overwrite, and are never modified. Resolving a refine against the personal root instead
   would silently create a shadow copy competing with the real skill, so neither shortcut is safe.
 - Skill names must match `^[a-z0-9][a-z0-9-]{0,63}$`, which rejects `../`, `..\`, `/`, and `.`;
   the resolved directory is additionally checked to be inside the root.
-- A `refine` naming a skill that does not exist is rejected, rather than silently degrading into
-  creating a new skill under an unexpected name. Both this and the containment check run at
-  submission time, so the agent can pick a different name rather than failing at approval.
+- A `refine` or `extend` naming a skill that does not exist is rejected, rather than silently
+  degrading into creating a new skill under an unexpected name. Both this and the containment check
+  run at submission time, so the agent can pick a different name rather than failing at approval.
+  `extend` additionally does a dry-run append when the proposal is submitted, so a duplicate
+  heading or unparseable frontmatter surfaces while the agent can still fix it.
 - Frontmatter values are collapsed to a single line, so a crafted name or description cannot
   inject extra YAML keys or terminate the block.
 - Any existing `SKILL.md` is copied to `SKILL.md.bak` before being replaced — keyed on the file

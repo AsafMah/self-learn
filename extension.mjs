@@ -449,8 +449,9 @@ The default answer is rejection. A lesson is worth capturing only if it clears E
    lesson is "read the docs", which nobody needs.
 4. TRANSFERABLE — it will apply in a future session on a DIFFERENT task. Not tied to this
    codebase's current state, this specific bug, or this file.
-5. UNCOVERED — no skill listed above already addresses this subject. If one does, this fails
-   unless the lesson materially CORRECTS that skill, in which case use target "refine".
+5. UNCOVERED — a skill above does not already tell you this. If one covers the same SUBJECT but
+   does not yet contain this case, that still passes: use target "extend" to add it. It fails
+   only when an existing skill already says it.
 
 Reject outright, without further thought:
 - a technique the agent applied correctly, or would have applied anyway
@@ -473,7 +474,7 @@ Respond with EXACTLY ONE JSON object and nothing else:
     "transferable":   {"pass": true|false, "why": "..."},
     "uncovered":      {"pass": true|false, "why": "..."}
   },
-  "target": "new"|"refine",
+  "target": "new"|"refine"|"extend",
   "skill": "...",
   "rationale": "..."
 }
@@ -483,10 +484,15 @@ Respond with EXACTLY ONE JSON object and nothing else:
   or wasted effort. It is checked against the transcript automatically. If you cannot find such a
   line, "expensive" does not pass. Do not paraphrase, and do not invent a plausible-looking line.
 - "why" is one short sentence per criterion.
-- "target": "refine" ONLY when the lesson belongs to the SAME SUBJECT as an existing skill, such
-  that a reader of it would expect to find this there. Merely adjacent is not enough —
-  mistargeting a refine corrupts an unrelated skill. "skill" must then be an exact name above.
-  Otherwise "new", with a short kebab-case name.
+- "target": choose by what the lesson does to an existing skill, and "skill" must then be an exact
+  name above:
+  - "extend" — the skill covers this subject and this is a NEW case it does not have. The lesson
+    is ADDED as a section; nothing already there is rewritten. Prefer this over "new" whenever a
+    skill above owns the subject, so related lessons stay together instead of scattering.
+  - "refine" — the skill says something this lesson shows is WRONG. Use only for a correction,
+    since it rewrites the whole skill.
+  - "new" — no skill above owns the subject. Give a short kebab-case name.
+  Merely adjacent is not enough: mistargeting corrupts an unrelated skill.
 - "rationale": under 400 chars, stating the lesson itself.\
 ${cfg("instructions") ? `\n\nAdditional instructions:\n${cfg("instructions")}` : ""}`;
 }
@@ -588,7 +594,7 @@ function parseVerdict(raw, transcript) {
 
     return {
         worthLearning: true,
-        target: parsed.target === "refine" ? "refine" : "new",
+        target: ["refine", "extend"].includes(parsed.target) ? parsed.target : "new",
         skill,
         rationale: sanitize(parsed.rationale, 600),
         reason: "all criteria passed with verified evidence",
@@ -1024,12 +1030,19 @@ function validateProposal(p) {
     if (!SKILL_NAME_RE.test(p.name ?? "")) {
         return `invalid skill name "${p.name}" (expected kebab-case, <=64 chars)`;
     }
-    if (!p.description || typeof p.description !== "string") return "description required";
+    if (p.mode !== "extend" && (!p.description || typeof p.description !== "string")) {
+        return "description required";
+    }
     if (!p.body || typeof p.body !== "string") return "body required";
     if (Buffer.byteLength(p.body, "utf8") > cfg("maxSkillBytes")) {
         return `body exceeds maxSkillBytes (${cfg("maxSkillBytes")})`;
     }
-    if (p.mode !== "new" && p.mode !== "refine") return `invalid mode "${p.mode}"`;
+    if (p.mode !== "new" && p.mode !== "refine" && p.mode !== "extend") {
+        return `invalid mode "${p.mode}"`;
+    }
+    if (p.mode === "extend" && !SECTION_TITLE_RE.test((p.section ?? "").trim())) {
+        return `mode "extend" needs a plain-text "section" title of 3-80 characters`;
+    }
     return validateSkillFiles(p);
 }
 
@@ -1037,6 +1050,56 @@ function renderSkillFile(p) {
     // Frontmatter values are single-line; strip anything that could break out of them.
     const oneLine = (s) => s.replace(/\r?\n/g, " ").replace(/"/g, "'").trim();
     return `---\nname: ${oneLine(p.name)}\ndescription: ${oneLine(p.description)}\n---\n\n${p.body.trim()}\n`;
+}
+
+// A section title becomes a markdown heading and is matched against existing headings to catch a
+// lesson being appended twice, so it stays plain text: no newlines, no leading "#".
+const SECTION_TITLE_RE = /^[A-Za-z0-9][A-Za-z0-9 ._'(),:\/-]{2,79}$/;
+
+const headingKey = (s) => s.replace(/^#+\s*/, "").replace(/\s+/g, " ").trim().toLowerCase();
+
+function splitFrontmatter(text) {
+    const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(text);
+    if (!match) return null;
+    return { frontmatter: match[1], body: text.slice(match[0].length) };
+}
+
+// Appends a section to an existing skill without any model rewriting what is already there.
+//
+// This is the whole point of extending rather than refining: a refine asks the agent to reproduce
+// the complete body, and every reproduction is a chance to quietly drop or water down an earlier
+// lesson. Here the existing bytes are carried across verbatim by the extension, so a skill can
+// accumulate cases over time without eroding.
+function appendSection(existingText, p) {
+    const parts = splitFrontmatter(existingText);
+    if (!parts) {
+        throw new Error(`"${p.name}" has no frontmatter block, so it cannot be extended safely.`);
+    }
+
+    const existingHeadings = (parts.body.match(/^#{1,6} .*$/gm) ?? []).map(headingKey);
+    if (existingHeadings.includes(headingKey(p.section))) {
+        throw new Error(
+            `"${p.name}" already has a section called "${p.section}". ` +
+                `Use mode "refine" to correct it, or pick a title for what is genuinely new.`,
+        );
+    }
+
+    // Only the description line is reissued, and only when the proposal supplies a new one: as a
+    // skill accumulates cases, its one-line description has to broaden or the skill stops being
+    // retrieved for the cases it just gained.
+    const description = p.description?.trim();
+    const frontmatter = description
+        ? parts.frontmatter.replace(
+              /^description:.*$/m,
+              `description: ${description.replace(/\r?\n/g, " ").replace(/"/g, "'")}`,
+          )
+        : parts.frontmatter;
+
+    // Trimmed, not merely right-trimmed: the frontmatter match leaves a leading newline behind,
+    // which would otherwise be re-added on every extend and accumulate blank lines. This also
+    // makes the result byte-identical to what renderSkillFile produces for the same body.
+    const body = parts.body.trim();
+    return `---\n${frontmatter}\n---\n\n${body}\n\n## ${p.section.trim()}\n\n${p.body.trim()}\n`;
 }
 
 // Resolves a skill's file path, enforcing that writes stay inside the user's personal skills root.
@@ -1049,7 +1112,7 @@ async function resolveSkillFile(session, name, { mode = "new" } = {}) {
     const root = await resolveSkillsRoot(session);
     const rootWithSep = root.endsWith(sep) ? root : root + sep;
 
-    if (mode === "refine") {
+    if (mode === "refine" || mode === "extend") {
         let existing;
         try {
             const { skills } = await session.rpc.skills.list();
@@ -1094,7 +1157,27 @@ async function writeSkill(session, p) {
 
     backup(file);
     mkdirSync(dir, { recursive: true });
-    writeFileSync(file, renderSkillFile(p), "utf8");
+
+    let content;
+    if (p.mode === "extend") {
+        if (!existed) {
+            throw new Error(`"${p.name}" does not exist, so there is nothing to extend.`);
+        }
+        content = appendSection(readFileSync(file, "utf8"), p);
+        // Checked against the assembled file rather than the new section alone: the point of the
+        // cap is what a future session pays to load the skill, and an umbrella only ever grows.
+        const size = Buffer.byteLength(content, "utf8");
+        if (size > cfg("maxSkillBytes")) {
+            throw new Error(
+                `extending "${p.name}" would reach ${size} bytes, over maxSkillBytes ` +
+                    `(${cfg("maxSkillBytes")}). It needs compacting before it can take more.`,
+            );
+        }
+    } else {
+        content = renderSkillFile(p);
+    }
+
+    writeFileSync(file, content, "utf8");
     debug(`wrote ${file} (mode=${p.mode}, existed=${existed})`);
 
     const dirWithSep = dir.endsWith(sep) ? dir : dir + sep;
@@ -1120,11 +1203,21 @@ async function writeSkill(session, p) {
 }
 
 function buildReflectionNudge(verdict) {
-    const target =
-        verdict.target === "refine"
-            ? `Refine the existing skill "${verdict.skill}". Read its current SKILL.md first and \
-produce the COMPLETE updated body, preserving what is still correct.`
-            : `Create a new skill named "${verdict.skill}".`;
+    let target;
+    if (verdict.target === "extend") {
+        target = `Add this to the existing skill "${verdict.skill}", which already covers the \
+subject. Read its current SKILL.md first, then write ONLY the new section — the extension appends \
+it and never rewrites what is already there, so do not reproduce the existing content. Call \
+\`propose_skill\` with mode "extend", the skill's name, a short \`section\` title for what you are \
+adding, and \`body\` set to just that section's text. Supply \`description\` only if the skill's \
+one-line description no longer covers what it now contains.`;
+    } else if (verdict.target === "refine") {
+        target = `Refine the existing skill "${verdict.skill}". Read its current SKILL.md first \
+and produce the COMPLETE updated body, preserving what is still correct. Use this only to correct \
+something it gets wrong; if you are ADDING a case it does not cover, use mode "extend" instead.`;
+    } else {
+        target = `Create a new skill named "${verdict.skill}".`;
+    }
 
     return `[self-learn] A reviewer model watching this session judged that the work just \
 completed contains a durable, reusable lesson.
@@ -1222,12 +1315,40 @@ async function resolvePendingProposal(session) {
         }
 
         const exists = existsSync(target.file);
-        const where = exists ? `OVERWRITE the existing skill "${p.name}"` : `create new skill "${p.name}"`;
+        const where =
+            p.mode === "extend"
+                ? `ADD a section to the existing skill "${p.name}"`
+                : exists
+                  ? `OVERWRITE the existing skill "${p.name}"`
+                  : `create new skill "${p.name}"`;
         const disabledNote = p.targetDisabled
             ? `\n\nNote: "${p.name}" is currently DISABLED in your settings, so this change will not \
 take effect until you re-enable it.`
             : "";
-        const backupNote = exists ? "\nThe previous version is kept as SKILL.md.bak." : "";
+        const backupNote =
+            p.mode === "extend"
+                ? "\nNothing already in the skill is rewritten; the section is appended."
+                : exists
+                  ? "\nThe previous version is kept as SKILL.md.bak."
+                  : "";
+        const heading = p.mode === "extend" ? `## ${p.section}\n\n` : "";
+        // For an extend the description is usually absent, and a broadened one is a change to the
+        // text that decides whether this skill is ever retrieved — so it is shown as a diff rather
+        // than presented as if it were the proposal's summary.
+        let lead = `${p.description}\n\n`;
+        if (p.mode === "extend") {
+            let current = "";
+            try {
+                const parts = splitFrontmatter(readFileSync(target.file, "utf8"));
+                current = /^description:\s*(.*)$/m.exec(parts?.frontmatter ?? "")?.[1]?.trim() ?? "";
+            } catch {
+                // Shown without the comparison rather than blocking the dialog.
+            }
+            lead =
+                p.description && p.description !== current
+                    ? `It also broadens when the skill gets retrieved:\n\nfrom: ${current}\nto: ${p.description}\n\n`
+                    : "";
+        }
         // The user is approving files a future session may EXECUTE, so they are shown rather than
         // merely counted, and any truncation is marked so nothing goes silently unseen. A
         // four-backtick fence survives content that itself contains a normal fence.
@@ -1257,8 +1378,8 @@ take effect until you re-enable it.`
         // suppresses escape processing, so the path shows exactly as it is on disk.
         const pathNote = `\n\nFile: \`${target.file}\``;
 
-        const message = `self-learn wants to ${where}.\n\n${p.description}\n\n\
-${closeOpenFence(truncate(p.body, 800))}\
+        const message = `self-learn wants to ${where}.\n\n${lead}\
+${heading}${closeOpenFence(truncate(p.body, 800))}\
 ${filesNote}${backupNote}${pathNote}${disabledNote}\n\nWrite it?`;
 
         let approved = false;
@@ -1544,17 +1665,35 @@ const session = await joinSession({
                         description: "True if on reflection there is no durable lesson worth saving.",
                     },
                     reason: { type: "string", description: "Why you declined, when decline is true." },
-                    mode: { type: "string", enum: ["new", "refine"], description: "Create or update." },
+                    mode: {
+                        type: "string",
+                        enum: ["new", "refine", "extend"],
+                        description:
+                            "new: create a skill. extend: append a section to an existing skill, " +
+                            "leaving its current content untouched — prefer this when adding a " +
+                            "case to a skill that already owns the subject. refine: rewrite an " +
+                            "existing skill, only to correct something it gets wrong.",
+                    },
                     name: { type: "string", description: "Kebab-case skill name." },
+                    section: {
+                        type: "string",
+                        description:
+                            "For mode=extend: short plain-text title for the section being added. " +
+                            "Must not duplicate a heading the skill already has.",
+                    },
                     description: {
                         type: "string",
-                        description: "One-line frontmatter description: when this skill applies.",
+                        description:
+                            "One-line frontmatter description: when this skill applies. For " +
+                            "mode=extend, supply it only to broaden a description that no longer " +
+                            "covers what the skill now contains; omitted leaves it unchanged.",
                     },
                     body: {
                         type: "string",
                         description:
-                            "Complete markdown body, without frontmatter. For mode=refine this " +
-                            "must be the full updated content, not a fragment.",
+                            "Markdown without frontmatter. For mode=new or refine this is the " +
+                            "complete body. For mode=extend it is ONLY the new section's text, " +
+                            "without its heading — never a copy of the existing content.",
                     },
                     files: {
                         type: "array",
@@ -1623,8 +1762,9 @@ const session = await joinSession({
                 };
 
                 const proposal = {
-                    mode: args?.mode === "refine" ? "refine" : "new",
+                    mode: ["refine", "extend"].includes(args?.mode) ? args.mode : "new",
                     name: (args?.name ?? "").trim(),
+                    section: (args?.section ?? "").trim(),
                     description: (args?.description ?? "").trim(),
                     body: args?.body ?? "",
                     files: args?.files,
@@ -1647,9 +1787,10 @@ const session = await joinSession({
                     existing = undefined;
                 }
 
-                if (proposal.mode === "refine" && !existing) {
+                if (proposal.mode !== "new" && !existing) {
+                    const verb = proposal.mode === "extend" ? "extended" : "refined";
                     return reject(
-                        `No skill named "${proposal.name}" exists, so it cannot be refined. ` +
+                        `No skill named "${proposal.name}" exists, so it cannot be ${verb}. ` +
                             `Either use mode "new" with a name that reflects the lesson's own ` +
                             `subject, or decline if the lesson belongs in an existing skill you ` +
                             `have not named correctly.`,
@@ -1657,14 +1798,25 @@ const session = await joinSession({
                 }
 
                 // Fail here rather than at approval, so the agent can still choose a new name.
+                let targetFile;
                 try {
-                    await resolveSkillFile(session, proposal.name, { mode: proposal.mode });
+                    targetFile = await resolveSkillFile(session, proposal.name, { mode: proposal.mode });
                 } catch (err) {
                     const reason = err?.message ?? String(err);
                     return reject(
                         `${reason} Propose a new personal skill instead, named for the ` +
                             `lesson's own subject.`,
                     );
+                }
+
+                // Assembled now, not at approval: a duplicate heading or unparseable frontmatter
+                // is something the agent can still fix, and by approval time it is too late.
+                if (proposal.mode === "extend") {
+                    try {
+                        appendSection(readFileSync(targetFile.file, "utf8"), proposal);
+                    } catch (err) {
+                        return reject(err?.message ?? String(err));
+                    }
                 }
 
                 // Refining a disabled skill would silently have no effect; surface it at approval.
