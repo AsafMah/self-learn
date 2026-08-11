@@ -17,6 +17,16 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname, resolve, sep } from "node:path";
+import {
+    MIN_QUOTE_CHARS,
+    sanitize,
+    parseVerdict,
+    looksLikeVerdict,
+    validateProposal,
+    renderSkillFile,
+    splitFrontmatter,
+    appendSection,
+} from "./lib.mjs";
 
 const DEFAULTS = {
     enabled: true,
@@ -51,14 +61,6 @@ const DEFAULTS = {
 };
 
 // Absorbs the lag between a sub-agent reporting idle and its reply appearing in the event log.
-// The verdict is computed from these in code, not reported by the model, so it cannot shortcut
-// to "yes" by asserting a conclusion. Every criterion must pass.
-const RUBRIC_CRITERIA = ["surprising", "expensive", "undiscoverable", "transferable", "uncovered"];
-
-// The `expensive` criterion must cite a verbatim line from the transcript, which is then checked
-// against the transcript actually sent. A quote short enough to match by accident proves nothing.
-const MIN_QUOTE_CHARS = 24;
-
 const SETTLED_EMPTY_POLL_LIMIT = 8;
 const SCREENER_DESCRIPTION = "Self-learn screening";
 
@@ -497,118 +499,8 @@ Respond with EXACTLY ONE JSON object and nothing else:
 ${cfg("instructions") ? `\n\nAdditional instructions:\n${cfg("instructions")}` : ""}`;
 }
 
-// Extracts balanced top-level JSON objects, ignoring braces inside strings. The previous
-// non-greedy regex could not handle the nested `criteria` object.
-function extractJsonObjects(raw) {
-    const text = String(raw).replace(/```(?:json)?/gi, "");
-    const found = [];
-    let depth = 0;
-    let start = -1;
-    let inString = false;
-    let escaped = false;
-
-    for (let i = 0; i < text.length; i++) {
-        const ch = text[i];
-        if (escaped) {
-            escaped = false;
-            continue;
-        }
-        if (ch === "\\") {
-            escaped = true;
-            continue;
-        }
-        if (ch === '"') {
-            inString = !inString;
-            continue;
-        }
-        if (inString) continue;
-
-        if (ch === "{") {
-            if (depth === 0) start = i;
-            depth++;
-        } else if (ch === "}") {
-            depth--;
-            if (depth === 0 && start >= 0) {
-                found.push(text.slice(start, i + 1));
-                start = -1;
-            }
-        }
-    }
-    return found;
-}
-
-const normaliseForMatch = (s) => String(s ?? "").replace(/\s+/g, " ").trim().toLowerCase();
-
-// The model reports evidence per criterion; the verdict is computed here. This is the point of
-// the design: the screener cannot reach "worth learning" by asserting a conclusion, only by
-// passing every criterion, one of which requires a quote that is checked against the transcript.
-function parseVerdict(raw, transcript) {
-    const reject = (reason) => ({ worthLearning: false, target: "new", skill: "", rationale: "", reason });
-
-    const candidates = extractJsonObjects(raw);
-    if (candidates.length === 0) return reject("no JSON object in screener reply");
-
-    let parsed;
-    for (const candidate of candidates.reverse()) {
-        try {
-            const obj = JSON.parse(candidate);
-            if (obj && typeof obj === "object" && obj.criteria) {
-                parsed = obj;
-                break;
-            }
-        } catch {
-            // Keep looking for a well-formed object.
-        }
-    }
-    if (!parsed) return reject("screener reply had no criteria object");
-
-    const failed = [];
-    for (const name of RUBRIC_CRITERIA) {
-        const c = parsed.criteria?.[name];
-        if (!c || typeof c.pass !== "boolean") return reject(`criterion "${name}" missing or malformed`);
-        // The screener's own reason is carried through: a bare list of failed criterion names
-        // cannot distinguish a rubric that is working from one that is misjudging, which left an
-        // earlier run of rejections uninvestigable. Whitespace is collapsed to keep the debug log
-        // one entry per line.
-        if (!c.pass) {
-            const why = sanitize(c.why, 200).replace(/\s+/g, " ").trim();
-            failed.push(`${name} (${why || "no reason given"})`);
-        }
-    }
-    if (failed.length > 0) return reject(`failed: ${failed.join("; ")}`);
-
-    // Every criterion claims to pass, so the quote backing "expensive" must hold up.
-    const quote = parsed.criteria.expensive?.quote;
-    if (typeof quote !== "string") return reject("expensive passed without a quote");
-
-    const q = normaliseForMatch(quote);
-    if (q.length < MIN_QUOTE_CHARS) {
-        return reject(`quote too short to be evidence (${q.length} < ${MIN_QUOTE_CHARS} chars)`);
-    }
-    if (!normaliseForMatch(transcript).includes(q)) {
-        return reject("quote does not appear in the transcript");
-    }
-
-    const skill = sanitize(parsed.skill, 80);
-    if (!skill) return reject("no skill name given");
-
-    return {
-        worthLearning: true,
-        target: ["refine", "extend"].includes(parsed.target) ? parsed.target : "new",
-        skill,
-        rationale: sanitize(parsed.rationale, 600),
-        reason: "all criteria passed with verified evidence",
-    };
-}
-
-// Screener output eventually reaches the main agent's context, so treat it as untrusted.
-function sanitize(text, limit) {
-    if (typeof text !== "string") return "";
-    let clean = text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, " ").trim();
-    clean = clean.replace(/<\/?(system|instructions?|advisor|self-learn)>/gi, "");
-    if (/ignore (all )?(your |the )?(previous|prior|above) instructions/i.test(clean)) return "";
-    return clean.slice(0, limit);
-}
+// Screener output eventually reaches the main agent's context and is treated as untrusted; the
+// JSON extraction, verdict parsing and sanitizer all live in lib.mjs, where they are tested.
 
 // Mirrors the advisor's recovery path: `tasks.list()` never populates `result` for a sub-agent
 // that parks in "idle", and the reported toolCallId is a stub for RPC-started agents, so the
@@ -627,29 +519,6 @@ function sanitize(text, limit) {
 // the same reply.
 let screenerWatch = null;
 
-// Accepts exactly what `parseVerdict` accepts, so the screener is never cut off on a message the
-// parser would then reject.
-function looksLikeVerdict(text) {
-    if (typeof text !== "string") return false;
-    for (const candidate of extractJsonObjects(text)) {
-        try {
-            const obj = JSON.parse(candidate);
-            if (obj && typeof obj === "object" && obj.criteria) return true;
-        } catch {
-            // Keep looking for a well-formed object.
-        }
-    }
-    return false;
-}
-
-// `startAgent` returns a task id ("self-learn"), but the event log tags that agent's events with
-// an internal id ("bg-<uuid>"), so the two cannot be compared directly. Nor does the event carry
-// the description passed to `startAgent`: `subagent.started` reports the agent *type's* metadata
-// (agentName "explore", agentDescription "Fast codebase exploration…"), which is why the
-// description match in `readReplyFromEventLog` never fires and it falls through to its model
-// check. The screener's own prompt is the one field only this extension could have produced, so
-// identity is taken from the sub-agent's first `user.message`. The watch is installed before the
-// agent starts, since that message can land while the task id is still in flight.
 function noteScreenerPrompt(event) {
     const watch = screenerWatch;
     if (!watch || watch.eventAgentId || !event?.agentId) return;
@@ -932,83 +801,6 @@ async function screen(session, { force = false, lookback = 0 } = {}) {
 // Stage 2/3: escalation, approval, and writing
 // ---------------------------------------------------------------------------
 
-const SKILL_NAME_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
-
-// A skill may ship supporting files beside SKILL.md — most usefully a script, since a check that
-// can be RUN is worth more than a paragraph describing the check. These are written into the
-// skill's own directory and nowhere else.
-//
-// Each segment must start alphanumeric, which rules out `..`, `.`, and dotfiles in one test
-// rather than by enumerating the cases to reject.
-const SKILL_FILE_SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
-const MAX_SKILL_FILES = 10;
-const MAX_SKILL_FILE_DEPTH = 3;
-
-// Rejects anything that is not a plain relative path inside the skill directory, and returns the
-// path in normalised form. Callers still re-check the resolved path against the directory before
-// writing: this is a filter on what the agent may ask for, not the last line of defence.
-function normaliseSkillFilePath(raw) {
-    if (typeof raw !== "string" || raw.trim() === "") return { error: "file path missing" };
-    const path = raw.trim().replace(/\\/g, "/");
-
-    if (path.startsWith("/") || /^[A-Za-z]:/.test(path)) {
-        return { error: `"${raw}" must be relative to the skill directory` };
-    }
-    if (/^SKILL\.md$/i.test(path)) {
-        return { error: `SKILL.md is written from "body", not from "files"` };
-    }
-
-    const segments = path.split("/").filter((s) => s !== "");
-    if (segments.length === 0) return { error: `"${raw}" is not a usable path` };
-    if (segments.length > MAX_SKILL_FILE_DEPTH) {
-        return { error: `"${raw}" is nested deeper than ${MAX_SKILL_FILE_DEPTH} levels` };
-    }
-    for (const segment of segments) {
-        if (!SKILL_FILE_SEGMENT_RE.test(segment)) {
-            return { error: `"${raw}" contains an unusable path segment "${segment}"` };
-        }
-    }
-    return { path: segments.join("/") };
-}
-
-function validateSkillFiles(p) {
-    if (p.files === undefined || p.files === null) {
-        p.files = [];
-        return null;
-    }
-    if (!Array.isArray(p.files)) return "files must be an array";
-    if (p.files.length > MAX_SKILL_FILES) {
-        return `too many files (${p.files.length} > ${MAX_SKILL_FILES})`;
-    }
-
-    const seen = new Set();
-    const normalised = [];
-    for (const entry of p.files) {
-        if (!entry || typeof entry !== "object") return "each file needs a path and content";
-        const { path, error } = normaliseSkillFilePath(entry.path);
-        if (error) return error;
-        if (typeof entry.content !== "string") return `"${path}" has no content`;
-
-        const key = path.toLowerCase();
-        if (seen.has(key)) return `"${path}" is listed twice`;
-        seen.add(key);
-        normalised.push({ path, content: entry.content });
-    }
-
-    // Budgeted together with the body: what matters is the total a future session pays to load
-    // the skill, not how it was split across files.
-    const total = normalised.reduce(
-        (n, f) => n + Buffer.byteLength(f.content, "utf8"),
-        Buffer.byteLength(p.body ?? "", "utf8"),
-    );
-    if (total > cfg("maxSkillBytes")) {
-        return `body and files total ${total} bytes, over maxSkillBytes (${cfg("maxSkillBytes")})`;
-    }
-
-    p.files = normalised;
-    return null;
-}
-
 // Derive the skills directory from the runtime's own reported paths rather than hardcoding it,
 // falling back to the documented personal location.
 async function resolveSkillsRoot(session) {
@@ -1023,83 +815,6 @@ async function resolveSkillsRoot(session) {
         // Fall through to the default.
     }
     return join(homedir(), ".agents", "skills");
-}
-
-function validateProposal(p) {
-    if (!p || typeof p !== "object") return "proposal missing";
-    if (!SKILL_NAME_RE.test(p.name ?? "")) {
-        return `invalid skill name "${p.name}" (expected kebab-case, <=64 chars)`;
-    }
-    if (p.mode !== "extend" && (!p.description || typeof p.description !== "string")) {
-        return "description required";
-    }
-    if (!p.body || typeof p.body !== "string") return "body required";
-    if (Buffer.byteLength(p.body, "utf8") > cfg("maxSkillBytes")) {
-        return `body exceeds maxSkillBytes (${cfg("maxSkillBytes")})`;
-    }
-    if (p.mode !== "new" && p.mode !== "refine" && p.mode !== "extend") {
-        return `invalid mode "${p.mode}"`;
-    }
-    if (p.mode === "extend" && !SECTION_TITLE_RE.test((p.section ?? "").trim())) {
-        return `mode "extend" needs a plain-text "section" title of 3-80 characters`;
-    }
-    return validateSkillFiles(p);
-}
-
-function renderSkillFile(p) {
-    // Frontmatter values are single-line; strip anything that could break out of them.
-    const oneLine = (s) => s.replace(/\r?\n/g, " ").replace(/"/g, "'").trim();
-    return `---\nname: ${oneLine(p.name)}\ndescription: ${oneLine(p.description)}\n---\n\n${p.body.trim()}\n`;
-}
-
-// A section title becomes a markdown heading and is matched against existing headings to catch a
-// lesson being appended twice, so it stays plain text: no newlines, no leading "#".
-const SECTION_TITLE_RE = /^[A-Za-z0-9][A-Za-z0-9 ._'(),:\/-]{2,79}$/;
-
-const headingKey = (s) => s.replace(/^#+\s*/, "").replace(/\s+/g, " ").trim().toLowerCase();
-
-function splitFrontmatter(text) {
-    const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(text);
-    if (!match) return null;
-    return { frontmatter: match[1], body: text.slice(match[0].length) };
-}
-
-// Appends a section to an existing skill without any model rewriting what is already there.
-//
-// This is the whole point of extending rather than refining: a refine asks the agent to reproduce
-// the complete body, and every reproduction is a chance to quietly drop or water down an earlier
-// lesson. Here the existing bytes are carried across verbatim by the extension, so a skill can
-// accumulate cases over time without eroding.
-function appendSection(existingText, p) {
-    const parts = splitFrontmatter(existingText);
-    if (!parts) {
-        throw new Error(`"${p.name}" has no frontmatter block, so it cannot be extended safely.`);
-    }
-
-    const existingHeadings = (parts.body.match(/^#{1,6} .*$/gm) ?? []).map(headingKey);
-    if (existingHeadings.includes(headingKey(p.section))) {
-        throw new Error(
-            `"${p.name}" already has a section called "${p.section}". ` +
-                `Use mode "refine" to correct it, or pick a title for what is genuinely new.`,
-        );
-    }
-
-    // Only the description line is reissued, and only when the proposal supplies a new one: as a
-    // skill accumulates cases, its one-line description has to broaden or the skill stops being
-    // retrieved for the cases it just gained.
-    const description = p.description?.trim();
-    const frontmatter = description
-        ? parts.frontmatter.replace(
-              /^description:.*$/m,
-              `description: ${description.replace(/\r?\n/g, " ").replace(/"/g, "'")}`,
-          )
-        : parts.frontmatter;
-
-    // Trimmed, not merely right-trimmed: the frontmatter match leaves a leading newline behind,
-    // which would otherwise be re-added on every extend and accumulate blank lines. This also
-    // makes the result byte-identical to what renderSkillFile produces for the same body.
-    const body = parts.body.trim();
-    return `---\n${frontmatter}\n---\n\n${body}\n\n## ${p.section.trim()}\n\n${p.body.trim()}\n`;
 }
 
 // Resolves a skill's file path, enforcing that writes stay inside the user's personal skills root.
@@ -1527,7 +1242,7 @@ function restorePendingProposal(session) {
         }
 
         // Re-validate: the file is editable on disk and must not be trusted to still be sane.
-        const problem = validateProposal(proposal);
+        const problem = validateProposal(proposal, cfg("maxSkillBytes"));
         if (problem) {
             debug(`discarding invalid persisted proposal: ${problem}`);
             rmSync(path);
@@ -1774,7 +1489,7 @@ const session = await joinSession({
                     why: state.lastVerdict?.rationale || (args?.description ?? "").trim(),
                 };
 
-                const problem = validateProposal(proposal);
+                const problem = validateProposal(proposal, cfg("maxSkillBytes"));
                 if (problem) return reject(`Proposal rejected: ${problem}`);
 
                 // A refine must name a skill that actually exists. Otherwise "refine" silently
