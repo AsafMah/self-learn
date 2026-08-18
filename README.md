@@ -525,42 +525,45 @@ turn earlier.
 
 ## Getting text in front of the user
 
-**In the GitHub Copilot app, an extension cannot show the user passive text at all.** Not at
-`info`, not at `warning`, not at `error`, and not with `{ ephemeral: true }`.
+**In the GitHub Copilot app, extension output currently does not render at all — and this is a
+regression in the app, not a property of the extension.** Asaf confirms he used to see these lines
+appear on their own, specifically advisor's `⚠ ADVISOR · CONCERN` banners. He no longer sees any,
+including the plain init banner in a brand-new session.
 
-Measured, from a probe that parked a line and flushed it from a real main-agent stop:
+Measured, from a probe that parked a line and flushed it from a real main-agent stop, plus a fresh
+session created solely to vary the one dimension nobody had varied:
 
 | Emitted from | `ephemeral` | Renders? |
 |---|---|---|
-| extension load | yes | **never witnessed** |
+| extension load, resumed session | yes | no |
+| extension load, resumed session | no | no |
+| extension load, **fresh session** | no | no |
 | `onAgentStop`, live turn | yes | no |
 | `onAgentStop`, live turn | no | no |
 | `session.idle` | no | no |
 | inside an open tool call | no | no |
 
-That first row used to read **yes**, on the assumption that the init banner is what users see. It
-was never actually witnessed. The companion `advisor` extension then forced a post-init `report()`
-by setting `timelineLevel: "error"` (documented to be coerced back to `info` and reported at
-startup), reloaded, and asked immediately with no intervening tool call: *"Neither — nothing
-appeared"* — no banner either. So either the init-only rule holds for a fresh session start but not
-for `extensions_reload`, or this app renders no extension output whatsoever and both banners were
-only ever visible in a terminal CLI. Nobody has varied that dimension; a fresh session would settle
-it. Until then the honest statement is that **no `session.log` output has ever been witnessed
-rendering in this app.**
+The first row of that table used to read **yes**, on the assumption that the init banner is what
+users see. It was never witnessed. The `advisor` extension broke it by forcing a post-init
+`report()` (setting `timelineLevel: "error"`, documented to be coerced back to `info` and reported
+at startup), reloading, and asking with no intervening tool call: no banner. This side then created
+a fresh session — ruling out "resumed sessions are stale", since this one has been resumed since
+Aug 5 and started on CLI `1.0.78-2` — and the banner did not render there either, on `1.0.80`.
 
-The user-visible surfaces that definitely work are `session.ui` (`elicitation`, `confirm`, `select`,
-`input`) — every one of which demands an answer. There is no passive channel. So a **hit** is
-announced by the approval dialog, and a **miss** is not announced at all: the alternative is
-interrupting the user with a dialog to tell them nothing happened.
+Bracketing: `session.info` events are present in transcripts throughout, and Asaf saw them at some
+earlier point. The earliest measured *invisible* one here is the non-ephemeral announcement at
+`09:21:21` on Aug 18. So the regression predates every fix attempted in this repo.
 
-This took four failed attempts, because the failure is perfectly silent — the call returns without
-throwing and does nothing. Three hypotheses about *when* logging works (startup only, only inside a
-live turn, only outside one) were wrong, and then a fourth about *how* — `ephemeral: true` — was
-wrong too, in a more instructive way: it correlated perfectly with visibility because the only call
-passing it was also the only call made during init. A confounded variable. The advisor extension
-flagged exactly that risk ("based only on correlation with the startup message; startup timing is
-also different") and recommended testing one ephemeral log from `onAgentStop` before changing
-anything. That advice was correct and was not taken until after the sweep.
+**The lesson is about attribution, not about logging.** Four hypotheses were burned trying to find
+the mistake in this extension's code, and a whole sweep was committed on the fourth, because "the
+user cannot see the output" was assumed to mean "the extension emits it wrongly". The host was
+never treated as a suspect, even though the transcript had shown all along that the messages were
+being emitted and recorded exactly as intended. When output is correct at every layer you control,
+suspect the layer you do not.
+
+Consequences while it lasts: a **hit** is announced by the approval dialog (`session.ui`, which does
+still work), and a **miss** is not announced. The announcement path is deliberately *kept* rather
+than deleted, because the mechanism is correct and will start working again when the app is fixed.
 
 ### `ephemeral: true` is worse than useless here
 
@@ -569,12 +572,21 @@ writes a `session.info` event with `infoType: "notification"` into the session's
 ephemeral one writes nothing at all. Measured on this session's own transcript: every user-facing
 message up to `10:51:12` is present as a `session.info`, and after the sweep added `ephemeral: true`
 there are none — the `11:13:12` announcement, which the debug log proves was emitted, left no event
-behind.
+behind. Removing the flag brought the record straight back (`11:34:09`, then `11:41:11` in the fresh
+session).
 
 So the sweep destroyed the only machine-readable record of what the extension had told the user, in
-exchange for a benefit that did not exist. The flag is now passed nowhere. Nothing renders either
-way, but the transcript is a real read-back channel: `events.jsonl` filtered to
-`type == "session.info"` is the answer to "what did self-learn actually say, and when".
+exchange for a benefit that did not exist. The flag is now passed nowhere. While the app is
+regressed the transcript is the only read-back channel there is: `events.jsonl` filtered to
+`type == "session.info"` answers "what did self-learn actually say, and when".
+
+Earlier reasoning error worth keeping, since it is a different one: `ephemeral: true` correlated
+perfectly with visibility because the only call passing it was also the only call made during init.
+A confounded variable. The advisor extension flagged exactly that risk ("based only on correlation
+with the startup message; startup timing is also different") and recommended testing one ephemeral
+log from `onAgentStop` before changing anything. That advice was correct and was not taken until
+after the sweep.
+
 
 
 **Severity must never be carried in `level`.** This one is unrelated to rendering and applies

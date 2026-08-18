@@ -239,12 +239,15 @@ function debug(message) {
 // The single place user-facing text is emitted, so there is one place to be honest about how
 // little of it the user actually sees.
 //
-// **In the GitHub Copilot app this renders nothing.** Measured, after four failed attempts to
-// make it work: a line emitted here from `onAgentStop`, on a real main-agent stop inside a live
-// turn, returned without throwing and was invisible — as were the same calls from `session.idle`
-// and from inside an open tool call. The only extension output this host displays is what is
-// emitted while the extension is initialising, which is why `self-learn ready` shows and nothing
-// afterwards ever does.
+// **In the GitHub Copilot app this currently renders nothing — because the app regressed, not
+// because this is wrong.** Asaf confirms he used to see these lines appear on their own. He now
+// sees none, including the plain init banner in a brand-new session on 1.0.80. Four hypotheses
+// were burned looking for the mistake in here before the host was suspected at all; the transcript
+// had shown the whole time that the messages were emitted and recorded exactly as intended.
+//
+// So this path is deliberately kept rather than deleted: it is correct, and it will start working
+// again when the app is fixed. Until then a hit is surfaced by the approval dialog (`session.ui`
+// still works) and a miss is not surfaced.
 //
 // `ephemeral: true` is NOT passed, and must not be. It never decided visibility — it looked
 // decisive purely because the startup line was both the only call passing it and the only call
@@ -254,13 +257,12 @@ function debug(message) {
 // and an ephemeral one writes nothing at all. Measured on this session's transcript — every
 // message up to 10:51 was recorded, and the 11:13 ephemeral probe left no event behind.
 //
-// So ephemeral traded a real benefit for an imaginary one. Nothing renders either way; without
-// it there is at least a read-back record for whoever goes looking afterwards.
+// While the app is regressed that transcript is the only read-back channel there is, so losing it
+// was the entire cost of the flag, for none of the benefit.
 //
-// So in this host the complete set of user-visible surfaces is the extension-init banner and
-// `session.ui` (`elicitation`/`confirm`/`select`/`input`), every one of which demands an answer.
-// A hit is therefore announced by the approval dialog; a miss cannot be announced at all without
-// interrupting the user, which is why the automatic path stays silent rather than pretending.
+// The one surface still proven to work is `session.ui` (`elicitation`/`confirm`/`select`/`input`),
+// every one of which demands an answer. The init banner is *not* one — that was an assumption, and
+// a fresh session disproved it.
 //
 // Severity belongs in the text, never in `level`. The host turns any `session.error` whose
 // errorType is not `model_call` into a *terminal* fault: it sets `hasError`, stops autopilot with
