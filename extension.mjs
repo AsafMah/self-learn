@@ -720,7 +720,7 @@ async function runScreener(session, prompt, { recognise = looksLikeVerdict, labe
                 return task.latestResponse;
             }
 
-            const { status, reply } = await readReplyFromEventLog(session, baseline);
+            const { status, reply } = await readReplyFromEventLog(session, baseline, watch.eventAgentId);
             if (status === "failed") throw new Error(reply);
             if (status === "done") {
                 debug(`reply via event log (fallback)`);
@@ -752,7 +752,21 @@ async function runScreener(session, prompt, { recognise = looksLikeVerdict, labe
     }
 }
 
-async function readReplyFromEventLog(session, baseline) {
+// Correlated by the event-stream agent id the watch resolved from the prompt prefix, which is the
+// only key here that has ever worked. Two earlier keys were wrong: `data.agentDescription` is the
+// agent *type's* blurb rather than the per-call description, so matching it against our own
+// description scored 0 across 1357 `subagent.started` events on this machine; and falling back to
+// `data.model` would happily claim the advisor extension's sub-agent whenever it ran the same
+// model, which is precisely the silent cross-wiring this must avoid. The task id cannot be used
+// either — it is a name like `self-learn-1`, while the event stream uses `bg-<uuid>`.
+//
+// Waiting for `subagent.completed` is deliberate here: this is the fallback for when the watch
+// never fired, so an earlier `assistant.message` could still be an intermediate one. Cancellation
+// (and with it notification suppression) is the watch's job, not this function's.
+async function readReplyFromEventLog(session, baseline, eventAgentId) {
+    // Identity not resolved yet — keep waiting rather than guess at a stranger's sub-agent.
+    if (!eventAgentId) return { status: "pending", reply: "" };
+
     let events = [];
     try {
         events = await session.getEvents();
@@ -761,17 +775,7 @@ async function readReplyFromEventLog(session, baseline) {
     }
 
     const recent = events.slice(baseline);
-    const candidates = recent.filter((e) => e?.type === "subagent.started" && e?.agentId);
-
-    // Never fall back to "first sub-agent seen": the advisor extension and the main agent both
-    // spawn sub-agents concurrently, and claiming a stranger's reply would silently cross-wire
-    // them. Require a positive identity match, or keep waiting.
-    const started =
-        candidates.find((e) => e?.data?.agentDescription === SCREENER_DESCRIPTION) ??
-        candidates.find((e) => e?.data?.model && e.data.model === cfg("screenerModel"));
-    if (!started) return { status: "pending", reply: "" };
-
-    const mine = (e) => e?.agentId === started.agentId;
+    const mine = (e) => e?.agentId === eventAgentId;
 
     const failed = recent.find((e) => e?.type === "subagent.failed" && mine(e));
     if (failed) return { status: "failed", reply: failed?.data?.error ?? "screener failed" };
