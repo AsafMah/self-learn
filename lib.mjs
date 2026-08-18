@@ -279,6 +279,64 @@ export function referencedSkillNames(text, names) {
     return found;
 }
 
+// Parses the drafter sub-agent's reply into a proposal.
+//
+// The mode and target skill are deliberately taken from the screener's verdict rather than from
+// the drafter's reply: letting the drafter choose them would let it quietly create a new skill
+// when the screener had decided to extend an existing one, which is exactly the accumulation of
+// narrow write-only skills that extending exists to avoid.
+export function parseDraft(raw, verdict) {
+    const candidates = extractJsonObjects(raw);
+    if (candidates.length === 0) return { error: "no JSON object in drafter reply" };
+
+    let parsed;
+    for (const candidate of candidates.reverse()) {
+        try {
+            const obj = JSON.parse(candidate);
+            if (obj && typeof obj === "object" && (typeof obj.body === "string" || obj.decline)) {
+                parsed = obj;
+                break;
+            }
+        } catch {
+            // Keep looking for a well-formed object.
+        }
+    }
+    if (!parsed) return { error: "drafter reply had no proposal object" };
+
+    if (parsed.decline === true) {
+        return { decline: true, reason: sanitize(parsed.reason, 300) || "(no reason)" };
+    }
+
+    return {
+        proposal: {
+            mode: verdict.target,
+            name: verdict.skill,
+            // Sanitized generously rather than to the validator's limit: truncating to exactly the
+            // maximum would turn an over-long title into a silently passing one, where letting it
+            // fail validation sends the drafter a correction it can act on.
+            section: sanitize(parsed.section, 120),
+            description: sanitize(parsed.description, 1000),
+            body: typeof parsed.body === "string" ? parsed.body : "",
+            files: parsed.files,
+            why: verdict.rationale,
+        },
+    };
+}
+
+// Whether an `onAgentStop` hook firing belongs to the main agent.
+//
+// The hook documents itself as top-level only, but measured behaviour disagrees: a sub-agent's
+// stop arrives with `input.sessionId` set to that agent's own `bg-<uuid>` while
+// `invocation.sessionId` stays the main session id. Without this guard the extension's own
+// screener and drafter would each trigger another stop, and self-learn would once again be
+// running against sub-agents.
+export function isMainAgentStop(input, mainSessionId) {
+    const id = input?.sessionId;
+    if (typeof id !== "string" || id === "") return false;
+    if (typeof mainSessionId !== "string" || mainSessionId === "") return false;
+    return id === mainSessionId;
+}
+
 export const headingKey = (s) => s.replace(/^#+\s*/, "").replace(/\s+/g, " ").trim().toLowerCase();
 
 export function splitFrontmatter(text) {

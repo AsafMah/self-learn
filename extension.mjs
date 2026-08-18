@@ -27,6 +27,8 @@ import {
     renderSkillFile,
     splitFrontmatter,
     appendSection,
+    parseDraft,
+    isMainAgentStop,
 } from "./lib.mjs";
 
 const DEFAULTS = {
@@ -110,9 +112,11 @@ const state = {
     lastEventIndex: 0,
     screeningInFlight: false,
     reviewRequested: null,
-    reflecting: false,
     rejectedProposals: 0,
     resolvingProposal: false,
+    // Retained from the last screening so the drafter can reuse it: reading the delta a second
+    // time would return nothing, because building it advances the event cursor.
+    lastTranscript: "",
     screenedTurns: 0,
     hits: 0,
     written: 0,
@@ -810,6 +814,7 @@ async function screen(session, { force = false, lookback = 0 } = {}) {
             debug(`skip: no new main-agent activity (lastEventIndex=${state.lastEventIndex})`);
             return { skipped: "no new activity" };
         }
+        state.lastTranscript = transcript;
 
         const skills = await listSkills(session);
         const declined = loadDeclined();
@@ -965,71 +970,176 @@ async function writeSkill(session, p) {
     return file;
 }
 
-function buildReflectionNudge(verdict) {
+// ---------------------------------------------------------------------------
+// Stage 2: drafting
+//
+// The skill is written by a second sub-agent, not by the main agent. An earlier design injected a
+// synthetic user message asking the main agent to draft it, which cost a full turn on the
+// expensive model and pushed the rubric and the entire skill inventory into the user's working
+// context. Nothing about drafting actually needs the main agent: the screener already reaches its
+// verdict from the transcript alone, and the user approves every write regardless of who wrote it.
+// ---------------------------------------------------------------------------
+
+const DRAFT_ATTEMPTS = 3;
+
+// How much of an existing skill the drafter is shown. Enough that it does not repeat a lesson the
+// skill already contains, capped so a large umbrella cannot crowd the transcript out of the prompt.
+const EXISTING_SKILL_BUDGET = 6000;
+
+async function readExistingSkill(session, name, mode) {
+    try {
+        const { file } = await resolveSkillFile(session, name, { mode });
+        if (!existsSync(file)) return null;
+        return readFileSync(file, "utf8");
+    } catch (err) {
+        debug(`could not read existing skill "${name}": ${err?.message ?? err}`);
+        return null;
+    }
+}
+
+function buildDrafterPrompt(verdict, transcript, existing) {
     let target;
     if (verdict.target === "extend") {
-        target = `Add this to the existing skill "${verdict.skill}", which already covers the \
-subject. Read its current SKILL.md first, then write ONLY the new section — the extension appends \
-it and never rewrites what is already there, so do not reproduce the existing content. Call \
-\`propose_skill\` with mode "extend", the skill's name, a short \`section\` title for what you are \
-adding, and \`body\` set to just that section's text. Supply \`description\` only if the skill's \
-one-line description no longer covers what it now contains.`;
+        target = `Add to the existing skill "${verdict.skill}". Write ONLY the new section: the \
+extension appends it verbatim and never rewrites what is already there, so do NOT reproduce any \
+existing content. Put a short title in "section", and just that section's text in "body". Supply \
+"description" ONLY if the skill's current one-line description would no longer cover what it \
+contains once your section is added; otherwise omit it.`;
     } else if (verdict.target === "refine") {
-        target = `Refine the existing skill "${verdict.skill}". Read its current SKILL.md first \
-and produce the COMPLETE updated body, preserving what is still correct. Use this only to correct \
-something it gets wrong; if you are ADDING a case it does not cover, use mode "extend" instead.`;
+        target = `Refine the existing skill "${verdict.skill}". Put the COMPLETE updated body in \
+"body", preserving everything still correct. This mode is for correcting something the skill gets \
+wrong, not for adding a case it simply does not cover.`;
     } else {
         target = `Create a new skill named "${verdict.skill}".`;
     }
 
-    return `[self-learn] A reviewer model watching this session judged that the work just \
-completed contains a durable, reusable lesson.
+    const current = existing
+        ? `\n\nThe skill as it stands today:\n\n<current_skill>\n${truncate(existing, EXISTING_SKILL_BUDGET)}\n</current_skill>`
+        : "";
 
-Its rationale: ${verdict.rationale}
+    return `You are drafting a reusable skill file from the transcript of a coding session. A \
+reviewer model has already judged that this session contains a durable, reusable lesson; your job \
+is to WRITE it well, not to re-litigate whether it is worth saving.
 
-${target}
+The rationale for saving it: ${verdict.rationale}
 
-Write the lesson so it will be useful in a FUTURE, UNRELATED session: state the trap and the \
-reliable technique, not the specifics of this task. Be concise and concrete.
+${target}${current}
 
-If any part of it can be executed rather than described — a check that proves the condition, a \
-command sequence that is easy to get wrong — ship that as a file alongside the skill via \`files\` \
-and reference it from the body. A future agent can run a script; it can only re-derive a \
-paragraph. Include ONLY a script you actually ran in this session and saw work: an untested \
-script is worse than none, because it will be trusted.
+Write the lesson so it is useful in a FUTURE, UNRELATED session: state the trap and the reliable \
+technique, not the specifics of this task. Be concise and concrete. The body is markdown WITHOUT \
+frontmatter — the extension adds that.
 
-When the draft is ready, call the \`propose_skill\` tool with it. Do NOT write any file yourself — \
-the extension handles writing after the user approves. Then stop; a one-line summary is enough. \
-If on reflection there is no genuinely durable lesson here, call \`propose_skill\` with \
-\`decline: true\` and a brief reason instead.`;
+If part of the lesson can be executed rather than described — a check that proves the condition, a \
+command sequence that is easy to get wrong — ship it as a file in "files" and reference it from \
+the body. A future agent can run a script; it can only re-derive a paragraph. Include ONLY a \
+script that actually ran in this transcript and was seen to work: an untested script is worse than \
+none, because it will be trusted.
+
+Reply with ONE JSON object and nothing else:
+
+{
+  "description": "one line saying when a future agent should load this skill",
+  "section": "short plain-text title, 3-80 chars (mode extend only)",
+  "body": "the markdown body",
+  "files": [{ "path": "check.ps1", "content": "..." }]
 }
 
-function escalate(session, verdict, { forced = false } = {}) {
-    if (state.pendingProposal) {
-        debug("escalation skipped: a proposal is already pending");
-        return;
+Omit "files" entirely if there is nothing worth shipping as a file. If the transcript does not in \
+fact support a durable lesson, reply with {"decline": true, "reason": "..."} instead.
+
+<transcript>
+${transcript}
+</transcript>`;
+}
+
+// Returns { proposal }, { decline, reason }, or { error }.
+async function draft(session, verdict, transcript) {
+    const existing =
+        verdict.target === "new"
+            ? null
+            : await readExistingSkill(session, verdict.skill, verdict.target);
+
+    // A refine or extend whose target cannot be read would otherwise degrade into writing over a
+    // skill the extension was unable to inspect.
+    if (verdict.target !== "new" && existing === null) {
+        return {
+            error: `"${verdict.skill}" could not be read, so it cannot be ${verdict.target}ed`,
+        };
     }
-    state.reflecting = true;
-    state.rejectedProposals = 0;
-    debug(`escalating to main agent: ${verdict.target} "${verdict.skill}" (forced=${forced})`);
 
-    // Deferred: sending from inside an event handler risks re-entering the agent loop.
-    setTimeout(() => {
-        session.send({ prompt: buildReflectionNudge(verdict) }).catch((err) => {
-            state.reflecting = false;
-            state.lastError = `escalation failed: ${err?.message ?? err}`;
-            debug(state.lastError);
-        });
-    }, 0);
+    let prompt = buildDrafterPrompt(verdict, transcript, existing);
+
+    for (let attempt = 1; attempt <= DRAFT_ATTEMPTS; attempt++) {
+        const raw = await runScreener(session, prompt);
+        const result = parseDraft(raw, verdict);
+
+        if (result.decline) return result;
+
+        const problem = result.error ?? validateProposal(result.proposal, cfg("maxSkillBytes"));
+        if (!problem) {
+            debug(`draft ready on attempt ${attempt}`);
+            return result;
+        }
+
+        debug(`draft attempt ${attempt} rejected: ${problem}`);
+        // Each attempt is a fresh sub-agent with no memory of the last one, so the correction is
+        // appended to the whole prompt rather than sent on its own.
+        prompt = `${prompt}\n\nYour previous reply was rejected: ${problem}\nFix exactly that, and \
+reply with ONE valid JSON object and nothing else.`;
+    }
+
+    return { error: `drafter produced no valid proposal in ${DRAFT_ATTEMPTS} attempts` };
 }
 
-// Raised while the proposing tool call is still open, so the dialog sits inside a turn the host
-// can finish. Resolving an elicitation after `assistant.turn_end` leaves the app showing "running"
-// with no turn left to end and no event an extension can emit to clear it — measured: turn_end at
-// 07:49:11, approval at 07:54:11, the write succeeded, and the UI stayed wedged.
+// Screen, and on a hit draft the skill and hold it for approval at the next main-agent stop.
+async function screenAndDraft(session, opts = {}) {
+    const verdict = await screen(session, opts);
+    if (!verdict?.worthLearning) return verdict;
+
+    if (!cfg("write")) {
+        debug("verdict was a hit, but writing is disabled in config");
+        return verdict;
+    }
+
+    const transcript = state.lastTranscript ?? "";
+    if (!transcript) {
+        debug("no transcript retained, so there is nothing to draft from");
+        return verdict;
+    }
+
+    const result = await draft(session, verdict, transcript);
+
+    if (result.decline) {
+        debug(`drafter declined: ${result.reason}`);
+        // Recorded like any other refusal, so the screener cannot raise the same subject next turn
+        // and spend another drafting round reaching the same conclusion.
+        recordDecline({ name: verdict.skill, why: result.reason, by: "agent" });
+        return verdict;
+    }
+    if (result.error) {
+        state.lastError = result.error;
+        debug(`drafting failed: ${result.error}`);
+        return verdict;
+    }
+
+    state.pendingProposal = result.proposal;
+    persistPendingProposal(session);
+    debug(
+        `draft held: ${result.proposal.mode} "${result.proposal.name}" — ` +
+            `awaiting the next main-agent stop`,
+    );
+    return verdict;
+}
+
+// Raised from the `onAgentStop` hook, which fires while the turn is still live — measured at 2.6s
+// before `session.idle`. Resolving an elicitation after `assistant.turn_end` leaves the app showing
+// "running" with no turn left to end and no event an extension can emit to clear it — measured:
+// turn_end at 07:49:11, approval at 07:54:11, the write succeeded, and the UI stayed wedged.
 //
-// Returns what happened, so the caller can tell the agent and so the idle fallback knows whether
-// a proposal is still outstanding.
+// Owns `state.resolvingProposal` itself, including clearing it: callers must not set that flag
+// before calling, or the guard below fires and the dialog never opens.
+//
+// Returns what happened, so the caller can report it.
 async function resolvePendingProposal(session) {
     const p = state.pendingProposal;
     if (!p || p.deferred) return "none";
@@ -1326,8 +1436,8 @@ const session = await joinSession({
                         type: "string",
                         enum: ["review", "status", "discard", "events", "declines"],
                         description:
-                            "review: screen and escalate on a hit. status: counters and pending " +
-                            "state. discard: drop the pending proposal without writing it. " +
+                            "review: screen, and draft a skill on a hit. status: counters and " +
+                            "pending state. discard: drop the pending proposal without writing it. " +
                             "events: which session event types have actually been delivered. " +
                             "declines: lessons already refused, which the screener will not raise again.",
                     },
@@ -1402,24 +1512,26 @@ const session = await joinSession({
                 // reproduced 6/6 from 2026-08-04 onward and 0/6 before it, with the extension
                 // unchanged across the boundary — see README, "The review hang".
                 //
-                // So the request is only recorded here; `session.idle` runs it once the turn
-                // ends and escalates through the normal deferred-send path.
+                // So the request is only recorded here; `session.idle` runs the screener and
+                // drafter once the turn ends, and the dialog follows at the next agent stop.
                 if (state.reviewRequested) return "A review is already queued for the end of this turn.";
                 state.reviewRequested = { lookback: 600 };
                 debug("review queued for end of turn");
                 return (
                     "Review queued. It runs once this turn ends, so that the screener never " +
-                    "runs inside an open tool call. If a lesson is found you will be asked to " +
-                    "reflect on your next turn. Report that to the user and stop."
+                    "runs inside an open tool call. If a lesson is found, the extension drafts " +
+                    "it and the user is asked to approve it directly. Report that and stop."
                 );
             },
         },
         {
             name: "propose_skill",
             description:
-                "Submit a drafted skill for the self-learn extension to write after user " +
-                "approval. Only call this when self-learn has explicitly asked you to reflect. " +
-                "Do not write skill files yourself.",
+                "Submit a skill for the self-learn extension to write after user approval. Call " +
+                "this whenever you have learned something durable and reusable that would help " +
+                "in a future, unrelated session — a trap worth warning about, or a technique " +
+                "worth repeating. State the lesson generally, not the specifics of this task. " +
+                "Do not write skill files yourself; the user approves every write.",
             parameters: {
                 type: "object",
                 properties: {
@@ -1489,33 +1601,24 @@ const session = await joinSession({
                     debug(`refused propose_skill from sub-agent call ${invocation?.toolCallId}`);
                     return { textResultForLlm: SUBAGENT_REFUSAL, resultType: "rejected" };
                 }
-                if (!state.reflecting) {
-                    return {
-                        textResultForLlm:
-                            "propose_skill is only valid during a self-learn reflection. Ignoring.",
-                        resultType: "rejected",
-                    };
-                }
                 if (args?.decline) {
-                    state.reflecting = false;
                     const reason = args?.reason ?? "(no reason)";
                     debug(`agent declined to propose: ${reason}`);
                     // Recorded too, not only user declines: the screener would otherwise raise the
-                    // same verdict next time and spend another unrequested escalation turn on it.
+                    // same subject next time and spend another drafting round reaching it again.
                     recordDecline({
-                        name: state.lastVerdict?.skill,
+                        name: args?.name || state.lastVerdict?.skill,
                         why: reason,
                         by: "agent",
                     });
                     return "Noted — nothing recorded.";
                 }
 
-                // A rejection below returns guidance that is useless if the retry is refused, so
-                // the reflection stays open. `session.idle` clears the flag when the turn ends.
+                // A rejection returns guidance that is useless if the agent cannot retry, so the
+                // attempt budget is per turn rather than per proposal.
                 const reject = (message) => {
                     debug(`rejected proposal: ${message}`);
                     if (++state.rejectedProposals >= MAX_REJECTED_PROPOSALS) {
-                        state.reflecting = false;
                         return {
                             textResultForLlm: `${message} No attempts left — stop and move on.`,
                             resultType: "failure",
@@ -1585,7 +1688,6 @@ const session = await joinSession({
                 // Refining a disabled skill would silently have no effect; surface it at approval.
                 proposal.targetDisabled = existing ? existing.enabled === false : false;
 
-                state.reflecting = false;
                 proposal.deferred = false;
                 state.pendingProposal = proposal;
                 persistPendingProposal(session);
@@ -1603,7 +1705,7 @@ const session = await joinSession({
                     case "abandoned":
                         return `Could not be saved: ${state.lastError ?? "unknown error"}. Do not retry.`;
                     default:
-                        // "retained" or "none": kept on disk, and the idle handler tries again.
+                        // "retained" or "none": kept on disk, and retried at the next agent stop.
                         return `Recorded, but approval could not be completed now (${state.lastError ?? "dialog unavailable"}). The user will be asked again.`;
                 }
             },
@@ -1611,6 +1713,37 @@ const session = await joinSession({
     ],
 
     hooks: {
+        // Where the approval dialog is raised.
+        //
+        // This fires at the agent's natural terminal stop, measured at ~2.6s BEFORE `session.idle`
+        // and while the turn is still live, which is exactly what an elicitation needs — resolving
+        // one after the turn has ended leaves the app wedged showing "running" with no turn left
+        // to finish.
+        onAgentStop: async (input) => {
+            // The hook documents itself as top-level only, but sub-agent stops arrive here too,
+            // carrying their own `bg-<uuid>` session id. Unfiltered, the extension's own screener
+            // and drafter would each trigger one.
+            if (!isMainAgentStop(input, session.sessionId)) {
+                debug(`ignored agentStop from sub-agent ${input?.sessionId}`);
+                return;
+            }
+            // Read-only check, for the log line only: `resolvePendingProposal` owns this flag and
+            // clears it in its own `finally`. Setting it here would make that function's own
+            // re-entrancy guard fire immediately and the dialog would never open.
+            if (state.resolvingProposal) {
+                debug("agentStop: a dialog is already open");
+                return;
+            }
+            if (!state.pendingProposal || state.pendingProposal.deferred) return;
+
+            try {
+                const outcome = await resolvePendingProposal(session);
+                debug(`agentStop: proposal resolved -> ${outcome}`);
+            } catch (err) {
+                debug(`agentStop: resolving proposal threw: ${err?.message ?? err}`);
+            }
+        },
+
         onUserPromptSubmitted: async (input) => {
             const prompt = input.prompt ?? "";
             if (await isSubAgentPrompt(prompt)) {
@@ -1619,6 +1752,7 @@ const session = await joinSession({
             }
             state.goal = prompt;
             state.toolCallsThisTurn = 0;
+            state.rejectedProposals = 0;
             // A held proposal becomes eligible once the user has taken their next turn.
             if (state.pendingProposal?.deferred) {
                 state.pendingProposal.deferred = false;
@@ -1654,10 +1788,10 @@ const session = await joinSession({
         },
         {
             name: "learn-now",
-            description: "Screen recent activity now, and escalate if there is something to learn",
+            description: "Screen recent activity now, and draft a skill if there is something to learn",
             handler: async () => {
                 await session.log("self-learn: screening recent activity…", { ephemeral: true });
-                const verdict = await screen(session, { force: true, lookback: 600 });
+                const verdict = await screenAndDraft(session, { force: true, lookback: 600 });
 
                 if (verdict?.error) {
                     await session.log(`self-learn: ${verdict.error}`, { level: "error" });
@@ -1669,15 +1803,14 @@ const session = await joinSession({
                     return;
                 }
                 if (!cfg("write")) {
-                    await session.log("self-learn: write is disabled; not escalating");
+                    await session.log("self-learn: write is disabled; nothing drafted");
                     return;
                 }
-                // Forced screening escalates too; otherwise a forced run could never lead to a
-                // write, since escalation normally happens only in the idle handler.
                 await session.log(
-                    `self-learn: drafting ${verdict.target} "${verdict.skill}" — you will be asked to approve it`,
+                    state.pendingProposal
+                        ? `self-learn: drafted ${state.pendingProposal.mode} "${state.pendingProposal.name}" — you will be asked to approve it when this turn ends`
+                        : `self-learn: found a lesson for "${verdict.skill}" but could not draft it${state.lastError ? ` (${state.lastError})` : ""}`,
                 );
-                escalate(session, verdict, { forced: true });
             },
         },
         {
@@ -1792,11 +1925,10 @@ session.on("session.task_complete", (event) => {
     if (!cfg("enabled") || !cfg("screenOnTaskComplete")) return;
     // A task the agent reports as failed has no lesson worth trusting yet.
     if (d.success === false) return;
-    if (state.reflecting || state.pendingProposal || state.screeningInFlight) return;
+    if (state.pendingProposal || state.screeningInFlight) return;
 
     void (async () => {
-        const verdict = await screen(session, { force: true, lookback: 600 });
-        if (verdict?.worthLearning && cfg("write")) escalate(session, verdict);
+        await screenAndDraft(session, { force: true, lookback: 600 });
     })().catch((err) => debug(`task_complete screening threw: ${err?.message ?? err}`));
 });
 
@@ -1805,7 +1937,7 @@ session.on("session.task_complete", (event) => {
 session.on("session.idle", (event) => {
     debug(
         `session.idle fired (aborted=${event?.data?.aborted === true}, toolCalls=${state.toolCallsThisTurn}, ` +
-            `reflecting=${state.reflecting}, pending=${state.pendingProposal?.name ?? "none"})`,
+            `pending=${state.pendingProposal?.name ?? "none"})`,
     );
     if (event?.data?.aborted) {
         debug("skip: turn was aborted");
@@ -1815,28 +1947,8 @@ session.on("session.idle", (event) => {
     }
 
     void (async () => {
-        // The escalated reflection turn has now ended, whether or not the agent actually called
-        // propose_skill. Clearing here prevents a silent agent from wedging the flag true and
-        // suppressing all further screening for the rest of the session.
-        if (state.reflecting) {
-            state.reflecting = false;
-            state.toolCallsThisTurn = 0;
-            debug(
-                state.pendingProposal
-                    ? "reflection turn ended; proposal captured"
-                    : "reflection turn ended without a proposal — clearing flag",
-            );
-            return;
-        }
-
-        // Approval fallback: a proposal normally resolves inside the propose_skill call, so this
-        // only catches one restored from disk after a reload, or one whose dialog could not be
-        // shown at the time.
-        if ((await resolvePendingProposal(session)) !== "none") {
-            state.toolCallsThisTurn = 0;
-            return;
-        }
-
+        // Approval is not attempted here. The dialog belongs at `onAgentStop`, which fires while
+        // the turn is still live; raising it once the turn has ended is what wedged the UI before.
         if (state.pendingProposal) {
             debug("skip: a proposal is still pending approval");
             state.toolCallsThisTurn = 0;
@@ -1845,20 +1957,15 @@ session.on("session.idle", (event) => {
         }
 
         // A review requested through the tool runs here, not in the tool handler, so that the
-        // screener sub-agent is never alive while a tool call is open. It still escalates as a
-        // forced reflection, so an explicit request can lead to a write just as it used to.
+        // screener sub-agent is never alive while a tool call is open.
         if (state.reviewRequested) {
             const { lookback } = state.reviewRequested;
             state.reviewRequested = null;
-            const verdict = await screen(session, { force: true, lookback });
+            const verdict = await screenAndDraft(session, { force: true, lookback });
             if (verdict?.error) {
                 debug(`requested review failed: ${verdict.error}`);
             } else if (!verdict?.worthLearning) {
                 debug(`requested review: nothing worth learning (${verdict?.reason ?? verdict?.skipped ?? "no reason"})`);
-            } else if (!cfg("write")) {
-                debug("requested review found a lesson, but writing is disabled in config");
-            } else {
-                escalate(session, verdict, { forced: true });
             }
             return;
         }
@@ -1870,8 +1977,7 @@ session.on("session.idle", (event) => {
             return;
         }
 
-        const verdict = await screen(session);
-        if (verdict?.worthLearning && cfg("write")) escalate(session, verdict);
+        await screenAndDraft(session);
     })().catch((err) => debug(`idle handler threw: ${err?.message ?? err}`));
 });
 

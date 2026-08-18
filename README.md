@@ -21,30 +21,61 @@ review requested  (user asks, or the agent calls self_learn_now at task completi
       ▼
 STAGE 1 — screener sub-agent (cheap model, own context)
   input: main-agent transcript window + inventory of existing skills
-  output: {"worthLearning", "target": "new"|"refine", "skill", "rationale"}
+  output: {"worthLearning", "target": "new"|"refine"|"extend", "skill", "rationale"}
       │
       ├─ false ──► done. The common case.
       │
       ▼
-STAGE 2 — the main agent drafts the skill
-  it has full context of its own reasoning, and submits via the `propose_skill` tool.
-  The agent never writes the file.
+STAGE 2 — drafter sub-agent (own context)
+  input: the same transcript + the screener's verdict + the existing skill, when extending
+  output: {"section", "description", "body"} — or {"decline"}
+  retried up to DRAFT_ATTEMPTS times, each retry carrying the validator's complaint.
       │
       ▼
-STAGE 3 — approval
+STAGE 3 — approval, raised from the `onAgentStop` hook
   session.ui.confirm(), then write + skills.reload()
 ```
 
 Set `autoScreen: true` to additionally review automatically at every yield with at least
 `minToolCalls` tool calls.
 
-Approval happens **inside the `propose_skill` tool call**, not at the next yield. An elicitation
-raised after the turn has ended leaves the host UI stuck showing "running" — see "The approval
-dialog must stay inside a turn" below.
+**Both stages are sub-agents, and the main agent is not involved in learning at all.** This is a
+deliberate reversal of the original design, in which the extension injected a `[self-learn]` message
+into the main agent's conversation and asked it to draft the skill. That worked, but the cost was
+structural: the main agent's context was spent on reflection, its transcript was polluted with a
+message the user never sent, and the injected turn could itself be screened. Because the runtime's
+only mechanism for making the main agent act is a user message — the `onAgentStop` block path calls
+`enqueueUserMessage` internally — injection could never be made cleaner, only avoided. So it is
+avoided.
 
-The hybrid split exists because screening is cheap and almost always negative, while drafting a
-good skill needs the main agent's own reasoning — which a sub-agent reading a transcript does not
-have.
+The tradeoff paid for that: a drafter reading a transcript does not have the main agent's own
+reasoning, so drafts may be weaker than they were. The retry loop and the `extend` mode are what
+compensate.
+
+Approval is raised from the **`onAgentStop` hook**, which fires while the turn is still live —
+measured at 2.6s before `session.idle`. An elicitation raised after the turn has ended leaves the
+host UI stuck showing "running"; see "The approval dialog must stay inside a turn" below. A
+consequence worth knowing: screening happens after the turn that produced the work, so the dialog
+appears at the end of the *following* turn.
+
+### What `onAgentStop` actually does here
+
+Measured against this host rather than assumed, because the documentation and the behaviour differ:
+
+| Question | Result |
+|---|---|
+| Does the hook fire? | Yes — `stopReason=end_turn`, 2.6s before `session.idle`, turn still live |
+| Is the transcript supplied? | Yes, `transcriptPath` — on main-agent stops only |
+| Can a sub-agent be started inside it? | **Yes**, 9ms — unlike a tool handler, where it wedges the CLI |
+| Can an elicitation be raised inside it? | **Yes**, resolved cleanly, no UI wedge |
+| Does it fire for sub-agents too? | **Yes**, despite documenting itself as top-level only |
+| Does it survive `extensions_reload` mid-turn? | No — that turn's stop is lost |
+
+The last two matter most. A sub-agent's stop arrives with `input.sessionId` set to that agent's own
+`bg-<uuid>` while `invocation.sessionId` stays the main session id, so `isMainAgentStop` compares
+against the main id and drops the rest. Without that filter the extension's own screener and drafter
+would each trigger a stop, and self-learn would be running against sub-agents — the exact bug this
+extension was first written to fix.
 
 ## The rubric
 
@@ -313,7 +344,7 @@ both surfaces.
 | `self_learn_now` (`action: "discard"`) | Drop the pending proposal without writing it. |
 | `self_learn_now` (`action: "events"`) | Which session event types have actually been delivered. |
 | `self_learn_now` (`action: "declines"`) | Lessons already refused, and the ledger's path. |
-| `propose_skill` | Used by the agent to submit a draft. Rejected outside a reflection. |
+| `propose_skill` | Propose a skill for approval. Usable at any time, by the user's agent directly. |
 
 In the CLI TUI these are also available as slash commands:
 
@@ -513,19 +544,23 @@ The extension side was provably correct: the approval resolved, the file was wri
 proposal was cleared. The UI stayed stuck anyway, and had to be stopped by hand. The same happened
 on decline, so it is a property of *when* the dialog is raised, not of the answer given.
 
-**Fix.** `propose_skill` now confirms and writes inside its own tool call, so the dialog belongs to
-a turn the host can finish. Verified on the same path: `external_tool.requested` → dialog →
-approval → write → `external_tool.completed` → `tool.execution_complete` → `assistant.turn_end`,
-and the indicator cleared itself.
+**Fix (superseded).** The first fix moved the dialog into `propose_skill`'s own tool call, so it
+belonged to a turn the host could finish. That worked and was verified on the same path.
+
+**Fix (current).** The dialog is now raised from the `onAgentStop` hook instead. The rule is
+unchanged — the elicitation must resolve while a turn is live — but `onAgentStop` was measured to
+fire 2.6s *before* `session.idle`, with the turn still open, so it satisfies the rule without
+requiring the main agent to call a tool at all. That is what allowed the main agent to be removed
+from the flow entirely.
 
 The original reason for deferring — that `session.idle` fires as the user regains the keyboard, so
-a dialog there could land on a reply being typed — no longer applies, because during an open tool
-call the user is already waiting on the agent. `state.forcedReflection` and the one-turn hold it
-controlled are gone. `session.idle` still resolves a proposal restored from disk after a reload, or
-one whose dialog could not be shown at the time.
+a dialog there could land on a reply being typed — is why the `session.idle` approval fallback has
+now been removed outright rather than kept as a backstop. A proposal restored from disk after a
+reload is therefore shown at the next `onAgentStop`, not immediately.
 
 Note this is the opposite constraint to the review hang above: a **sub-agent** must not be started
-inside a tool handler, while an **elicitation** must be raised inside one.
+inside a tool handler, while an **elicitation** must be raised inside a live turn. `onAgentStop` is
+the one place measured to permit both.
 
 ## Cancelling the screener to keep it out of the main agent's context
 

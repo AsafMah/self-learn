@@ -10,6 +10,8 @@ import {
     renderSkillFile,
     splitFrontmatter,
     appendSection,
+    parseDraft,
+    isMainAgentStop,
 } from "./lib.mjs";
 
 const LIMIT = 65536;
@@ -294,4 +296,87 @@ test("a broadened description cannot inject frontmatter keys", () => {
     });
     assert.equal((grown.match(/^---$/gm) ?? []).length, 2);
     assert.equal(splitFrontmatter(grown).frontmatter.split("\n").length, 2);
+});
+
+// --- drafter reply parsing -------------------------------------------------
+
+const VERDICT = { target: "extend", skill: "kql-expert", rationale: "because" };
+
+const draftJson = (over = {}) =>
+    JSON.stringify({
+        section: "Cross-cluster joins",
+        description: "a description",
+        body: "some body",
+        ...over,
+    });
+
+test("a draft takes its mode and name from the verdict, not from the reply", () => {
+    // The drafter must not be able to redirect the write: a verdict to extend an existing skill
+    // that came back as a brand-new one would silently bypass the user's target.
+    const d = parseDraft(draftJson({ mode: "new", name: "something-else" }), VERDICT);
+    assert.equal(d.proposal.mode, "extend");
+    assert.equal(d.proposal.name, "kql-expert");
+});
+
+test("a draft carries the verdict's rationale through as `why`", () => {
+    assert.equal(parseDraft(draftJson(), VERDICT).proposal.why, "because");
+});
+
+test("a declining draft is recognised and its reason kept", () => {
+    const d = parseDraft(JSON.stringify({ decline: true, reason: "nothing durable" }), VERDICT);
+    assert.equal(d.decline, true);
+    assert.equal(d.reason, "nothing durable");
+    assert.equal(d.proposal, undefined);
+});
+
+test("a decline with no reason still parses", () => {
+    assert.equal(parseDraft(JSON.stringify({ decline: true }), VERDICT).reason, "(no reason)");
+});
+
+test("prose around the JSON is tolerated", () => {
+    const d = parseDraft(`Here is my draft:\n\n${draftJson()}\n\nHope that helps.`, VERDICT);
+    assert.equal(d.proposal.body, "some body");
+});
+
+test("a reply with no JSON at all is an error, not a silent empty draft", () => {
+    const d = parseDraft("I could not think of anything.", VERDICT);
+    assert.ok(d.error);
+    assert.equal(d.proposal, undefined);
+});
+
+test("a reply whose only JSON lacks a body is an error", () => {
+    const d = parseDraft(JSON.stringify({ section: "x", description: "y" }), VERDICT);
+    assert.ok(d.error);
+});
+
+test("an over-long section is left long enough to fail validation rather than truncated into a pass", () => {
+    const d = parseDraft(draftJson({ section: "x".repeat(200) }), VERDICT);
+    assert.match(
+        validateProposal(d.proposal, LIMIT),
+        /section/,
+        "an over-long section must be reported, not silently truncated into a passing one",
+    );
+});
+
+// --- agent-stop filtering --------------------------------------------------
+
+test("a stop from the main agent is accepted", () => {
+    assert.equal(isMainAgentStop({ sessionId: "abc-123" }, "abc-123"), true);
+});
+
+test("a stop from a sub-agent is refused", () => {
+    // Measured: a sub-agent's stop arrives with its own bg-<uuid>. Letting it through is what
+    // would put self-learn back to running against sub-agents.
+    assert.equal(isMainAgentStop({ sessionId: "bg-93dfcc06-dead-beef" }, "abc-123"), false);
+});
+
+test("a stop with a missing or empty session id is refused", () => {
+    assert.equal(isMainAgentStop({}, "abc-123"), false);
+    assert.equal(isMainAgentStop({ sessionId: "" }, "abc-123"), false);
+    assert.equal(isMainAgentStop(undefined, "abc-123"), false);
+});
+
+test("an unknown main session id refuses everything rather than matching loosely", () => {
+    assert.equal(isMainAgentStop({ sessionId: "abc-123" }, ""), false);
+    assert.equal(isMainAgentStop({ sessionId: "abc-123" }, undefined), false);
 });
