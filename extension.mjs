@@ -236,18 +236,30 @@ function debug(message) {
     }
 }
 
-// The only channel that puts text in front of the user without asking them to click something.
+// The single place user-facing text is emitted, so there is one place to be honest about how
+// little of it the user actually sees.
 //
-// `ephemeral: true` is load-bearing, not a detail. Without it this host renders nothing at any
-// level — measured: an announcement logged from `onAgentStop` inside a live turn returned without
-// throwing and was invisible, as were the same calls from `session.idle`. The one message that was
-// always visible, "self-learn ready", is the one that happened to pass this flag. `session.ui` is
-// the only other user-visible surface and every member of it (elicitation, confirm, select, input)
-// demands an answer, so this is the whole of the passive channel.
+// **In the GitHub Copilot app this renders nothing.** Measured, after four failed attempts to
+// make it work: a line emitted here from `onAgentStop`, on a real main-agent stop inside a live
+// turn, returned without throwing and was invisible — as were the same calls from `session.idle`
+// and from inside an open tool call. The only extension output this host displays is what is
+// emitted while the extension is initialising, which is why `self-learn ready` shows and nothing
+// afterwards ever does.
+//
+// `ephemeral: true` is kept because it is correct for hosts that do render, but it is NOT what
+// decides visibility. It looked decisive for a while purely because the startup line was both the
+// only call passing it and the only call made during init — a confounded variable, and a mistake
+// the advisor extension warned about before the sweep that acted on it.
+//
+// So in this host the complete set of user-visible surfaces is the extension-init banner and
+// `session.ui` (`elicitation`/`confirm`/`select`/`input`), every one of which demands an answer.
+// A hit is therefore announced by the approval dialog; a miss cannot be announced at all without
+// interrupting the user, which is why the automatic path stays silent rather than pretending.
 //
 // Severity belongs in the text, never in `level`. The host turns any `session.error` whose
 // errorType is not `model_call` into a *terminal* fault: it sets `hasError`, stops autopilot with
 // reason "error" and marks the session failed. Reporting a failed draft is not a session failure.
+// That one is unrelated to rendering and matters on every host.
 async function say(text) {
     try {
         await session.log(text, { ephemeral: true });

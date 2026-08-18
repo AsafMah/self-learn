@@ -525,39 +525,47 @@ turn earlier.
 
 ## Getting text in front of the user
 
-`session.log(text)` renders **nothing** in this host. Not at `info`, not at `warning`, not at
-`error`. The flag that decides visibility is `ephemeral`:
+**In the GitHub Copilot app, an extension cannot show the user passive text at all.** Not at
+`info`, not at `warning`, not at `error`, and not with `{ ephemeral: true }`. The only extension
+output this host renders is what is emitted while the extension is initialising — which is why
+`self-learn ready` appears and nothing afterwards ever does.
 
-```js
-await session.log(text, { ephemeral: true });   // visible
-await session.log(text);                        // goes to the timeline; nobody sees it
-```
+Measured, from a probe that parked a line and flushed it from a real main-agent stop:
 
-This cost four failed attempts to find, because the failure is completely silent — the call
-returns without throwing and simply does nothing. Three hypotheses about *when* logging works
-(only at startup, only inside a live turn, only outside one) were all wrong; an announcement
-logged from `onAgentStop` inside a live turn, on the same code path as an approval dialog that
-appeared correctly, was still invisible. The single message that had always been visible,
-`self-learn ready`, turned out to be the only one that passed the flag.
-
-The whole user-visible surface, enumerated rather than guessed:
-
-| Surface | Passive? | Renders? |
+| Emitted from | `ephemeral` | Renders? |
 |---|---|---|
-| `session.log(…, { ephemeral: true })` | yes | **yes** |
-| `session.log(…)` any level | yes | no |
-| `session.ui.confirm` / `select` / `input` / `elicitation` | no — demands an answer | yes |
+| extension load | yes | **yes** |
+| `onAgentStop`, live turn | yes | no |
+| `onAgentStop`, live turn | no | no |
+| `session.idle` | no | no |
+| inside an open tool call | no | no |
 
-So `say()` is the only way to tell the user something without interrupting them, and every
-user-facing message goes through it. The one deliberate exception is the `logToTimeline` record,
-which is meant to be durable rather than seen.
+The complete set of user-visible surfaces here is that init banner plus `session.ui`
+(`elicitation`, `confirm`, `select`, `input`) — every one of which demands an answer. There is no
+passive channel. So a **hit** is announced by the approval dialog, and a **miss** is not announced
+at all: the alternative is interrupting the user with a dialog to tell them nothing happened.
 
-**Severity must never be carried in `level`.** The host turns any `session.error` whose
-`errorType` is not `model_call` into a *terminal* fault: it sets `hasError`, stops autopilot with
-reason "error", and marks the session failed. Four call sites here logged failed drafts at
-`level: "error"`, so reporting that a draft could not be written could end the session it was
-reporting to. This is the same defect the companion `advisor` extension hit and fixed; severity
-now lives in the message text.
+This took four failed attempts, because the failure is perfectly silent — the call returns without
+throwing and does nothing. Three hypotheses about *when* logging works (startup only, only inside a
+live turn, only outside one) were wrong, and then a fourth about *how* — `ephemeral: true` — was
+wrong too, in a more instructive way: it correlated perfectly with visibility because the only call
+passing it was also the only call made during init. A confounded variable. The advisor extension
+flagged exactly that risk ("based only on correlation with the startup message; startup timing is
+also different") and recommended testing one ephemeral log from `onAgentStop` before changing
+anything. That advice was correct and was not taken until after the sweep.
+
+`ephemeral: true` is still passed, because it is right for hosts that do render. It is simply not
+what decides visibility here.
+
+**Severity must never be carried in `level`.** This one is unrelated to rendering and applies
+everywhere. The host turns any `session.error` whose `errorType` is not `model_call` into a
+*terminal* fault: it sets `hasError`, stops autopilot with reason "error", and marks the session
+failed. Four call sites here logged failed drafts at `level: "error"`, so reporting that a draft
+could not be written could end the session it was reporting to. This is the same defect the
+companion `advisor` extension found and fixed; severity now lives in the message text.
+
+Note also that this host loads extension **tools and hooks but not slash commands**, so `/learn`
+and the other commands below are unreachable from the app and can only be used from the CLI.
 
 ## The approval dialog must stay inside a turn
 
