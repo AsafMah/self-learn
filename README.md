@@ -526,9 +526,29 @@ turn earlier.
 ## Getting text in front of the user
 
 **In the GitHub Copilot app, extension output currently does not render at all — and this is a
-regression in the app, not a property of the extension.** Asaf confirms he used to see these lines
-appear on their own, specifically advisor's `⚠ ADVISOR · CONCERN` banners. He no longer sees any,
-including the plain init banner in a brand-new session.
+regression in the app, which has happened before.** Asaf filed it as
+[github/app#2765](https://github.com/github/app/issues/2765), *"Extensions who send `info` or
+`warning` level logs are not shown in the app"*, on Aug 11 at 12:57:14 against app `1.1.6`. It was
+closed COMPLETED and the release bot confirms it was **fixed in app v1.1.8** on Aug 12. The app here
+is now **1.1.10** and the symptom is back.
+
+That issue was filed in the same minute as the advisor concern banner recorded at `12:57:22` in this
+session's transcript — i.e. it was filed *because* one of these very messages failed to appear.
+
+Component attribution is **isolated by measurement**, not inferred. The same CLI binary (`1.0.80`)
+running this same extension, invoked as `copilot -p "..."` in a plain terminal, prints
+
+```
+● self-learn ready — review on request, and automatically after >=5 tool calls
+```
+
+to stdout. Same CLI, same extension, same non-ephemeral `session.log` — renders in the terminal,
+does not render in the app. So the CLI and this code are both fine and the app is the failing layer.
+That test costs one command and no witness; it should have been the *first* thing run, and instead
+it came after a fresh-session probe, a live-watched probe, and four wrong hypotheses.
+
+Nothing in the 1.1.9 or 1.1.10 release notes names it; the nearest suspects are 1.1.10's transcript
+changes ("background items and queued message management … enabled by default").
 
 Measured, from a probe that parked a line and flushed it from a real main-agent stop, plus a fresh
 session created solely to vary the one dimension nobody had varied:
@@ -538,17 +558,26 @@ session created solely to vary the one dimension nobody had varied:
 | extension load, resumed session | yes | no |
 | extension load, resumed session | no | no |
 | extension load, **fresh session** | no | no |
+| extension load, **user watching live** | no | no |
+| extension load, **plain terminal CLI 1.0.80** | no | **yes** |
 | `onAgentStop`, live turn | yes | no |
 | `onAgentStop`, live turn | no | no |
 | `session.idle` | no | no |
 | inside an open tool call | no | no |
 
-The first row of that table used to read **yes**, on the assumption that the init banner is what
-users see. It was never witnessed. The `advisor` extension broke it by forcing a post-init
-`report()` (setting `timelineLevel: "error"`, documented to be coerced back to `info` and reported
-at startup), reloading, and asking with no intervening tool call: no banner. This side then created
-a fresh session — ruling out "resumed sessions are stale", since this one has been resumed since
-Aug 5 and started on CLI `1.0.78-2` — and the banner did not render there either, on `1.0.80`.
+Every row but one shares a confound worth naming: the witness was asked *after* the fact. The app
+has had an "Announcement duration" setting since v1.0.24 that auto-dismisses notifications, so "I
+see nothing" and "it appeared and vanished" are the same observation to a witness questioned a
+minute later — the error `advisor` caught in its own first test, and then this side repeated it in
+every probe above. The fourth row removes it: Asaf watched the window live, was told the reload was
+coming, and reported nothing appeared at all, not even a flash.
+
+The first row used to read **yes**, on the assumption that the init banner is what users see. It was
+never witnessed. The `advisor` extension broke it by forcing a post-init `report()` (setting
+`timelineLevel: "error"`, documented to be coerced back to `info` and reported at startup),
+reloading, and asking with no intervening tool call: no banner. This side then created a fresh
+session — ruling out "resumed sessions are stale", since this one has been resumed since Aug 5 and
+started on CLI `1.0.78-2` — and the banner did not render there either, on `1.0.80`.
 
 Bracketing: `session.info` events are present in transcripts throughout, and Asaf saw them at some
 earlier point. The earliest measured *invisible* one here is the non-ephemeral announcement at
@@ -563,7 +592,7 @@ suspect the layer you do not.
 
 Consequences while it lasts: a **hit** is announced by the approval dialog (`session.ui`, which does
 still work), and a **miss** is not announced. The announcement path is deliberately *kept* rather
-than deleted, because the mechanism is correct and will start working again when the app is fixed.
+than deleted, because the mechanism is correct and worked before app v1.1.10 — it will work again.
 
 ### `ephemeral: true` is worse than useless here
 

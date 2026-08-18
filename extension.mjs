@@ -239,15 +239,19 @@ function debug(message) {
 // The single place user-facing text is emitted, so there is one place to be honest about how
 // little of it the user actually sees.
 //
-// **In the GitHub Copilot app this currently renders nothing — because the app regressed, not
-// because this is wrong.** Asaf confirms he used to see these lines appear on their own. He now
-// sees none, including the plain init banner in a brand-new session on 1.0.80. Four hypotheses
-// were burned looking for the mistake in here before the host was suspected at all; the transcript
-// had shown the whole time that the messages were emitted and recorded exactly as intended.
+// **In the GitHub Copilot app this currently renders nothing — an app regression, isolated by
+// measurement, not a mistake in here.** The same CLI (1.0.80) running the same extension prints
+// `● self-learn ready` to stdout in a plain terminal, so the CLI and this code are both fine and
+// only the app fails to display it. The same symptom was github/app#2765 ("Extensions who send
+// info or warning level logs are not shown in the app"), fixed in app v1.1.8; the app is now
+// 1.1.10 and it is back. Also verified with the user watching the window live, so it is not an
+// announcement auto-dismissing before he looked. Four hypotheses were burned looking for the
+// mistake in this extension before the host was suspected at all, though the transcript had shown
+// the whole time that the messages were emitted and recorded exactly as intended.
 //
-// So this path is deliberately kept rather than deleted: it is correct, and it will start working
-// again when the app is fixed. Until then a hit is surfaced by the approval dialog (`session.ui`
-// still works) and a miss is not surfaced.
+// So this path is deliberately kept rather than deleted: it is correct, and it worked before and
+// will work again. Until then a hit is surfaced by the approval dialog (`session.ui` still works)
+// and a miss is not surfaced.
 //
 // `ephemeral: true` is NOT passed, and must not be. It never decided visibility — it looked
 // decisive purely because the startup line was both the only call passing it and the only call
@@ -257,7 +261,7 @@ function debug(message) {
 // and an ephemeral one writes nothing at all. Measured on this session's transcript — every
 // message up to 10:51 was recorded, and the 11:13 ephemeral probe left no event behind.
 //
-// While the app is regressed that transcript is the only read-back channel there is, so losing it
+// While the host is regressed that transcript is the only read-back channel there is, so losing it
 // was the entire cost of the flag, for none of the benefit.
 //
 // The one surface still proven to work is `session.ui` (`elicitation`/`confirm`/`select`/`input`),
