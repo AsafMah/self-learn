@@ -302,6 +302,53 @@ what has real invariants — that the rubric cannot be talked past, that a quote
 the transcript, that writes cannot escape the skill directory, that frontmatter cannot be broken out
 of, and that repeated extends keep the previous file as an exact byte prefix.
 
+### What the tests are worth, measured
+
+A green suite is not evidence that the tests would catch anything. The only way to find out is to
+break the code on purpose and see whether they notice, so 42 deliberate regressions were injected
+into `lib.mjs` one at a time and the suite run against each.
+
+```
+npm run mutate
+```
+
+The harness is `mutate.mjs`, committed so these numbers can be re-checked rather than believed.
+Mutants are keyed to exact source strings, so a change to `lib.mjs` that stops one matching is
+reported as `UNMATCHED` and excluded from the tally instead of quietly counting as a catch.
+
+The first pass caught **32 of 42**. The ten survivors were each checked by hand rather than
+tallied, and nine were real gaps, now closed:
+
+- A `toolu_…` sub-agent stop was never tested. `isMainAgentStop` is documented as comparing for
+  equality precisely because a `bg-` prefix test would let every `task`-tool sub-agent through —
+  and replacing the equality with exactly that prefix test passed the whole suite. The most
+  carefully explained invariant in the file was the one nothing checked.
+- An over-long body was unbounded when a proposal had no `files`, because `validateSkillFiles`
+  returns early in that case and the shared-budget test only ever exercised the path with files.
+- A verdict naming no skill, a non-string file content, an unbounded file count, a missing body,
+  an unenforced `sanitize` limit, a brace inside a quoted string, and a `---` rule in a body that
+  a greedy frontmatter match would swallow.
+
+The tenth is an equivalent mutant: removing the `id === ""` check in `isMainAgentStop` changes no
+behaviour, because the only case where it could decide anything requires an empty main session id,
+which the next line already refuses. Confirmed against 126 input pairs rather than argued.
+The second pass catches **41 of 42**, the exception being that mutant.
+
+Two things make this measurement lie, and both look exactly like success:
+
+- **A mutation that does not apply.** If the text being replaced is not in the source, nothing is
+  mutated and the suite passes for the wrong reason. Every mutation here asserts it matched
+  exactly once and is reported as `UNMATCHED` rather than counted if it did not.
+- **A misparsed result.** The first run of this harness reported every mutant as a crash, because
+  it parsed TAP's `# fail 0` while Node's default reporter prints `ℹ fail 0`. The tally was right
+  by luck — the exit codes were real — but a harness that cannot read its own output is not
+  evidence. It now runs `--test-reporter tap` and names the first failing test for every catch, so
+  a claimed kill can be spot-checked against the assertion that made it.
+
+One design note that follows from this: a test must not recompute the limit it is pinning.
+`too many files are refused` writes out `11` rather than deriving it from `MAX_SKILL_FILES`,
+because a test that derives the bound moves with it and would survive the constant being raised.
+
 That last one is not decoration. The helpers were previously verified by extracting them from the
 source with string offsets, and the extraction was fragile enough that a real defect got through:
 `appendSection` re-added a leading newline every call, so a skill grew a blank line per extend.

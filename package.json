@@ -6,6 +6,7 @@
     "type": "module",
     "license": "MIT",
     "scripts": {
-        "test": "node --test"
+        "test": "node --test",
+        "mutate": "node mutate.mjs"
     }
 }
