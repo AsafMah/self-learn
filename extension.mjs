@@ -115,6 +115,11 @@ const state = {
     reviewRequested: null,
     rejectedProposals: 0,
     resolvingProposal: false,
+    // Announcements cannot be made from `session.idle`: screening finishes after the turn has
+    // ended, and an extension log with no live turn to attach to renders nowhere. Measured twice —
+    // the call succeeds, writes nothing, and the user sees silence. So the text is parked here and
+    // flushed from `onAgentStop`, which is still inside a turn.
+    pendingAnnouncement: null,
     // Retained from the last screening so the drafter can reuse it: reading the delta a second
     // time would return nothing, because building it advances the event cursor.
     lastTranscript: "",
@@ -1136,13 +1141,12 @@ async function screenAndDraft(session, opts = {}) {
         `draft held: ${result.proposal.mode} "${result.proposal.name}" — ` +
             `awaiting the next main-agent stop`,
     );
-    // Announced rather than merely logged to file. Drafting now happens entirely inside sub-agents,
-    // so without this the first the user hears of a lesson is the approval dialog, a turn later.
-    // Deliberately silent on a miss: most screenings are negative, and narrating them would be noise.
-    await session.log(
+    // Parked rather than logged now: this runs after `session.idle`, where there is no live turn
+    // for an extension log to render into. `onAgentStop` flushes it at the start of the next turn's
+    // end, alongside the approval dialog it belongs with.
+    state.pendingAnnouncement =
         `self-learn: drafted ${result.proposal.mode} "${result.proposal.name}" — ` +
-            `you will be asked to approve it when this turn ends`,
-    );
+        `approve or decline it below`;
     return verdict;
 }
 
@@ -1742,6 +1746,20 @@ const session = await joinSession({
                 debug(`ignored agentStop from sub-agent ${input?.sessionId}`);
                 return;
             }
+
+            // Flushed here because this is the first moment inside a live turn after screening
+            // finished at idle. Done before the dialog, and outside the pending-proposal checks,
+            // so a miss is still reported when there is nothing to approve.
+            if (state.pendingAnnouncement) {
+                const text = state.pendingAnnouncement;
+                state.pendingAnnouncement = null;
+                try {
+                    await session.log(text);
+                    debug(`announced: ${text}`);
+                } catch (err) {
+                    debug(`announcement failed: ${err?.message ?? err}`);
+                }
+            }
             // Read-only check, for the log line only: `resolvePendingProposal` owns this flag and
             // clears it in its own `finally`. Setting it here would make that function's own
             // re-entrancy guard fire immediately and the dialog would never open.
@@ -1980,16 +1998,15 @@ session.on("session.idle", (event) => {
             const { lookback } = state.reviewRequested;
             state.reviewRequested = null;
             const verdict = await screenAndDraft(session, { force: true, lookback });
-            // Announced, not just logged to file. A hit is announced by `screenAndDraft`; the
-            // misses are announced here because the user asked for this review explicitly, and
-            // answering an explicit request with silence looks identical to nothing having run.
-            // The automatic path stays quiet on a miss, where most screenings are negative.
+            // Announced on the next stop rather than now: see `state.pendingAnnouncement`. A hit is
+            // announced by `screenAndDraft`; the misses are announced here because the user asked
+            // for this review explicitly, and answering an explicit request with silence looks
+            // identical to nothing having run. The automatic path stays quiet on a miss.
             if (verdict?.error) {
-                await session.log(`self-learn: review failed — ${verdict.error}`);
+                state.pendingAnnouncement = `self-learn: review failed — ${verdict.error}`;
             } else if (!verdict?.worthLearning) {
-                await session.log(
-                    `self-learn: nothing worth learning (${verdict?.reason ?? verdict?.skipped ?? "no reason given"})`,
-                );
+                state.pendingAnnouncement =
+                    `self-learn: nothing worth learning (${verdict?.reason ?? verdict?.skipped ?? "no reason given"})`;
             }
             return;
         }
