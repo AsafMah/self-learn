@@ -583,6 +583,16 @@ now cancelled the moment its verdict is parseable, rather than being left to fin
 itself. Across 61 recorded runs the verdict message precedes `subagent.completed` by 1.6–4.8 s
 (median ~2.0 s), so the window is comfortable rather than a race worth being clever about.
 
+**Every sub-agent needs its own recogniser, and forgetting that reintroduces the bug.** Cancelling
+early depends on noticing that the reply has arrived, and "has it arrived" is a question about the
+*shape* of the message. The recogniser was originally hard-coded to the verdict shape. When the
+drafter was added it inherited none of the suppression: its reply is a draft, not a verdict, so it
+was never recognised, never cancelled, and ran to completion — at which point the CLI announced
+"Agent self-learn-1 has finished" to the main agent, which then called `read_agent` and got nothing.
+Observed live at 08:57:33, one turn after the drafter shipped. `runScreener` now takes a `recognise`
+predicate (`looksLikeVerdict` or `looksLikeDraft`), so a new sub-agent cannot silently opt out of
+suppression by having a different reply shape.
+
 **Identity is the hard part, and cost two failed runs.** There are two id namespaces:
 `startAgent` returns a *task* id derived from `name` (`self-learn-1`), while the event log tags the
 same agent `bg-<uuid>`. They are never equal, and `cancel`/`remove` accept only the former.

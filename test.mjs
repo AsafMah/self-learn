@@ -12,6 +12,7 @@ import {
     appendSection,
     parseDraft,
     isMainAgentStop,
+    looksLikeDraft,
 } from "./lib.mjs";
 
 const LIMIT = 65536;
@@ -356,6 +357,35 @@ test("an over-long section is left long enough to fail validation rather than tr
         /section/,
         "an over-long section must be reported, not silently truncated into a passing one",
     );
+});
+
+// --- early-cancel recognition ----------------------------------------------
+
+test("a drafter reply is recognised as a draft", () => {
+    assert.equal(looksLikeDraft(draftJson()), true);
+});
+
+test("a declining drafter reply is recognised", () => {
+    assert.equal(looksLikeDraft(JSON.stringify({ decline: true, reason: "no" })), true);
+});
+
+test("a draft is not mistaken for a verdict, and vice versa", () => {
+    // This is the regression that shipped: the early cancel recognised only verdict-shaped
+    // replies, so every drafter ran to completion and the CLI announced it to the main agent.
+    assert.equal(looksLikeVerdict(draftJson()), false);
+    assert.equal(looksLikeDraft(verdictJson()), false);
+});
+
+test("an unfinished or empty draft is not recognised", () => {
+    assert.equal(looksLikeDraft(""), false);
+    assert.equal(looksLikeDraft("still thinking about it"), false);
+    assert.equal(looksLikeDraft(JSON.stringify({ body: "   " })), false);
+    assert.equal(looksLikeDraft(JSON.stringify({ section: "x" })), false);
+    assert.equal(looksLikeDraft(undefined), false);
+});
+
+test("prose around a draft still counts as recognised", () => {
+    assert.equal(looksLikeDraft(`Here you go:\n${draftJson()}\ndone`), true);
 });
 
 // --- agent-stop filtering --------------------------------------------------

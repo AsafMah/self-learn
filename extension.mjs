@@ -22,6 +22,7 @@ import {
     sanitize,
     parseVerdict,
     looksLikeVerdict,
+    looksLikeDraft,
     referencedSkillNames,
     validateProposal,
     renderSkillFile,
@@ -586,12 +587,15 @@ function noteScreenerMessage(event) {
     if (!watch || !watch.agentId || !event?.agentId) return;
     if (event.agentId !== watch.eventAgentId) return;
     const content = event?.data?.content;
-    if (!looksLikeVerdict(content)) return;
+    // Which shape counts as "finished" depends on what this sub-agent was asked for. Hard-coding
+    // the verdict shape here meant the drafter was never recognised, so it ran to completion and
+    // the CLI announced it to the main agent — the exact noise the early cancel exists to prevent.
+    if (!watch.recognise(content)) return;
     screenerWatch = null;
     watch.onVerdict(content);
 }
 
-async function runScreener(session, prompt) {
+async function runScreener(session, prompt, { recognise = looksLikeVerdict, label = "screener" } = {}) {
     const rpc = session.rpc;
     if (!rpc?.tasks?.startAgent) throw new Error("session.rpc.tasks.startAgent unavailable");
 
@@ -613,6 +617,7 @@ async function runScreener(session, prompt) {
         agentId: null,
         eventAgentId: null,
         promptHead: prompt.slice(0, 160),
+        recognise,
         onVerdict: (content) => {
             earlyReply = content;
             // Cancel before awaiting anything, so the agent cannot settle in the gap.
@@ -622,11 +627,11 @@ async function runScreener(session, prompt) {
                     cancelledEarly = result?.cancelled === true;
                     debug(
                         cancelledEarly
-                            ? `screener cancelled on verdict (notification suppressed)`
-                            : `screener settled before cancel — notification will fire`,
+                            ? `${label} cancelled on reply (notification suppressed)`
+                            : `${label} settled before cancel — notification will fire`,
                     );
                 })
-                .catch((err) => debug(`cancel-on-verdict failed: ${err?.message ?? err}`))
+                .catch((err) => debug(`cancel-on-reply failed: ${err?.message ?? err}`))
                 .finally(signalEarly);
         },
     };
@@ -647,7 +652,7 @@ async function runScreener(session, prompt) {
         throw err;
     }
     watch.agentId = agentId;
-    debug(`screener ${agentId} started on ${cfg("screenerModel")} (baseline ${baseline})`);
+    debug(`${label} ${agentId} started on ${cfg("screenerModel")} (baseline ${baseline})`);
 
     const deadline = Date.now() + cfg("timeoutMs");
     let seen = false;
@@ -1070,7 +1075,10 @@ async function draft(session, verdict, transcript) {
     let prompt = buildDrafterPrompt(verdict, transcript, existing);
 
     for (let attempt = 1; attempt <= DRAFT_ATTEMPTS; attempt++) {
-        const raw = await runScreener(session, prompt);
+        const raw = await runScreener(session, prompt, {
+            recognise: looksLikeDraft,
+            label: "drafter",
+        });
         const result = parseDraft(raw, verdict);
 
         if (result.decline) return result;

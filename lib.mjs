@@ -145,6 +145,27 @@ export function parseVerdict(raw, transcript) {
 
 // Accepts exactly what `parseVerdict` accepts, so the screener is never cut off on a message the
 // parser would then reject.
+// Whether a sub-agent message is a finished draft, in the same sense `looksLikeVerdict` recognises
+// a finished verdict: enough to cancel on, before the host emits a completion event.
+//
+// This must exist separately. Cancelling early is what suppresses the CLI's "agent has finished"
+// notification to the main agent, and a drafter's reply is not verdict-shaped, so recognising only
+// verdicts leaves every drafter running to completion and announcing itself.
+export function looksLikeDraft(text) {
+    if (typeof text !== "string") return false;
+    for (const candidate of extractJsonObjects(text)) {
+        try {
+            const obj = JSON.parse(candidate);
+            if (!obj || typeof obj !== "object") continue;
+            if (obj.decline === true) return true;
+            if (typeof obj.body === "string" && obj.body.trim()) return true;
+        } catch {
+            // Keep looking for a well-formed object.
+        }
+    }
+    return false;
+}
+
 export function looksLikeVerdict(text) {
     if (typeof text !== "string") return false;
     for (const candidate of extractJsonObjects(text)) {
