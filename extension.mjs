@@ -256,10 +256,10 @@ function debug(message) {
 // `ephemeral: true` is NOT passed, and must not be. It never decided visibility — it looked
 // decisive purely because the startup line was both the only call passing it and the only call
 // made during init, a confounded variable the advisor extension warned about before the sweep
-// that acted on it. What it actually does is suppress the durable record: a non-ephemeral call
-// writes a `session.info` event (`infoType: "notification"`) into the session's `events.jsonl`,
-// and an ephemeral one writes nothing at all. Measured on this session's transcript — every
-// message up to 10:51 was recorded, and the 11:13 ephemeral probe left no event behind.
+// that acted on it. What it actually means, measured under the CLI where rendering still works,
+// is **transient**: the line is drawn and then dropped on redraw, and no `session.info` event is
+// written to `events.jsonl`. A coherent feature, and the wrong one here — the whole point is a
+// record the user can find afterwards.
 //
 // While the host is regressed that transcript is the only read-back channel there is, so losing it
 // was the entire cost of the flag, for none of the benefit.

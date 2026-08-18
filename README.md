@@ -594,20 +594,50 @@ Consequences while it lasts: a **hit** is announced by the approval dialog (`ses
 still work), and a **miss** is not announced. The announcement path is deliberately *kept* rather
 than deleted, because the mechanism is correct and worked before app v1.1.10 — it will work again.
 
-### `ephemeral: true` is worse than useless here
+### What `ephemeral: true` actually does
 
-It does not affect rendering, and it *suppresses the durable record*. A non-ephemeral `session.log`
-writes a `session.info` event with `infoType: "notification"` into the session's `events.jsonl`; an
-ephemeral one writes nothing at all. Measured on this session's own transcript: every user-facing
-message up to `10:51:12` is present as a `session.info`, and after the sweep added `ephemeral: true`
-there are none — the `11:13:12` announcement, which the debug log proves was emitted, left no event
-behind. Removing the flag brought the record straight back (`11:34:09`, then `11:41:11` in the fresh
-session).
+Measured directly, with a throwaway extension that emitted one line each way in the same run, under
+the terminal CLI where rendering still works:
 
-So the sweep destroyed the only machine-readable record of what the extension had told the user, in
-exchange for a benefit that did not exist. The flag is now passed nowhere. While the app is
-regressed the transcript is the only read-back channel there is: `events.jsonl` filtered to
-`type == "session.info"` answers "what did self-learn actually say, and when".
+| | renders in CLI | survives redraw | `session.info` event |
+|---|---|---|---|
+| `session.log(text)` | yes | yes — present in 10 frames | **yes** |
+| `session.log(text, { ephemeral: true })` | yes | no — present in 2 frames | **no** |
+
+So it is not inert and it is not a "don't show this" flag: it means **transient**. The line is drawn
+and then dropped, and nothing is written to `events.jsonl`. That is a coherent feature — a status
+message you do not want cluttering a transcript — and it is simply the wrong choice here, where the
+whole point is a record the user can find afterwards.
+
+An earlier version of this section claimed the flag "does not affect rendering". That was wrong, and
+wrong the same way as everything else in this saga: asserted from the app, where *nothing* renders,
+so the flag looked inert because its effect was masked by the regression. It took the CLI — the one
+host where rendering works — to see what it does at all.
+
+The consequence for this repo is unchanged: **the flag is passed nowhere.** A non-ephemeral
+`session.log` writes a `session.info` event with `infoType: "notification"`; an ephemeral one writes
+nothing. Measured on this session's own transcript: every user-facing message up to `10:51:12` is
+present, and after the sweep added `ephemeral: true` there are none — the `11:13:12` announcement,
+which the debug log proves was emitted, left no event behind. Removing the flag brought the record
+straight back (`11:34:09`, then `11:41:11` in a fresh session).
+
+So the sweep destroyed the only machine-readable record of what the extension had told the user, and
+bought transience nobody wanted. While the app is regressed the transcript is the only read-back
+channel there is.
+
+**To check whether the app has been fixed**, rather than trusting this document:
+
+```powershell
+# does the extension still emit? (should always be yes)
+Select-String -Path "$env:USERPROFILE\.copilot\session-state\<session-id>\events.jsonl" `
+  -Pattern '"type":"session\.info"' | Select-Object -Last 5
+
+# does a host still render it? (CLI = yes; app = the thing under test)
+copilot -p "Reply with exactly: ok" --allow-all-tools
+```
+
+If the event is present and the app shows nothing, github/app#2765 is still broken. Guidance that
+says how to check does not rot when the answer changes.
 
 Earlier reasoning error worth keeping, since it is a different one: `ephemeral: true` correlated
 perfectly with visibility because the only call passing it was also the only call made during init.
