@@ -526,24 +526,32 @@ turn earlier.
 ## Getting text in front of the user
 
 **In the GitHub Copilot app, an extension cannot show the user passive text at all.** Not at
-`info`, not at `warning`, not at `error`, and not with `{ ephemeral: true }`. The only extension
-output this host renders is what is emitted while the extension is initialising — which is why
-`self-learn ready` appears and nothing afterwards ever does.
+`info`, not at `warning`, not at `error`, and not with `{ ephemeral: true }`.
 
 Measured, from a probe that parked a line and flushed it from a real main-agent stop:
 
 | Emitted from | `ephemeral` | Renders? |
 |---|---|---|
-| extension load | yes | **yes** |
+| extension load | yes | **never witnessed** |
 | `onAgentStop`, live turn | yes | no |
 | `onAgentStop`, live turn | no | no |
 | `session.idle` | no | no |
 | inside an open tool call | no | no |
 
-The complete set of user-visible surfaces here is that init banner plus `session.ui`
-(`elicitation`, `confirm`, `select`, `input`) — every one of which demands an answer. There is no
-passive channel. So a **hit** is announced by the approval dialog, and a **miss** is not announced
-at all: the alternative is interrupting the user with a dialog to tell them nothing happened.
+That first row used to read **yes**, on the assumption that the init banner is what users see. It
+was never actually witnessed. The companion `advisor` extension then forced a post-init `report()`
+by setting `timelineLevel: "error"` (documented to be coerced back to `info` and reported at
+startup), reloaded, and asked immediately with no intervening tool call: *"Neither — nothing
+appeared"* — no banner either. So either the init-only rule holds for a fresh session start but not
+for `extensions_reload`, or this app renders no extension output whatsoever and both banners were
+only ever visible in a terminal CLI. Nobody has varied that dimension; a fresh session would settle
+it. Until then the honest statement is that **no `session.log` output has ever been witnessed
+rendering in this app.**
+
+The user-visible surfaces that definitely work are `session.ui` (`elicitation`, `confirm`, `select`,
+`input`) — every one of which demands an answer. There is no passive channel. So a **hit** is
+announced by the approval dialog, and a **miss** is not announced at all: the alternative is
+interrupting the user with a dialog to tell them nothing happened.
 
 This took four failed attempts, because the failure is perfectly silent — the call returns without
 throwing and does nothing. Three hypotheses about *when* logging works (startup only, only inside a
@@ -554,8 +562,20 @@ flagged exactly that risk ("based only on correlation with the startup message; 
 also different") and recommended testing one ephemeral log from `onAgentStop` before changing
 anything. That advice was correct and was not taken until after the sweep.
 
-`ephemeral: true` is still passed, because it is right for hosts that do render. It is simply not
-what decides visibility here.
+### `ephemeral: true` is worse than useless here
+
+It does not affect rendering, and it *suppresses the durable record*. A non-ephemeral `session.log`
+writes a `session.info` event with `infoType: "notification"` into the session's `events.jsonl`; an
+ephemeral one writes nothing at all. Measured on this session's own transcript: every user-facing
+message up to `10:51:12` is present as a `session.info`, and after the sweep added `ephemeral: true`
+there are none — the `11:13:12` announcement, which the debug log proves was emitted, left no event
+behind.
+
+So the sweep destroyed the only machine-readable record of what the extension had told the user, in
+exchange for a benefit that did not exist. The flag is now passed nowhere. Nothing renders either
+way, but the transcript is a real read-back channel: `events.jsonl` filtered to
+`type == "session.info"` is the answer to "what did self-learn actually say, and when".
+
 
 **Severity must never be carried in `level`.** This one is unrelated to rendering and applies
 everywhere. The host turns any `session.error` whose `errorType` is not `model_call` into a

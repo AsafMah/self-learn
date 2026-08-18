@@ -246,10 +246,16 @@ function debug(message) {
 // emitted while the extension is initialising, which is why `self-learn ready` shows and nothing
 // afterwards ever does.
 //
-// `ephemeral: true` is kept because it is correct for hosts that do render, but it is NOT what
-// decides visibility. It looked decisive for a while purely because the startup line was both the
-// only call passing it and the only call made during init — a confounded variable, and a mistake
-// the advisor extension warned about before the sweep that acted on it.
+// `ephemeral: true` is NOT passed, and must not be. It never decided visibility — it looked
+// decisive purely because the startup line was both the only call passing it and the only call
+// made during init, a confounded variable the advisor extension warned about before the sweep
+// that acted on it. What it actually does is suppress the durable record: a non-ephemeral call
+// writes a `session.info` event (`infoType: "notification"`) into the session's `events.jsonl`,
+// and an ephemeral one writes nothing at all. Measured on this session's transcript — every
+// message up to 10:51 was recorded, and the 11:13 ephemeral probe left no event behind.
+//
+// So ephemeral traded a real benefit for an imaginary one. Nothing renders either way; without
+// it there is at least a read-back record for whoever goes looking afterwards.
 //
 // So in this host the complete set of user-visible surfaces is the extension-init banner and
 // `session.ui` (`elicitation`/`confirm`/`select`/`input`), every one of which demands an answer.
@@ -262,9 +268,9 @@ function debug(message) {
 // That one is unrelated to rendering and matters on every host.
 async function say(text) {
     try {
-        await session.log(text, { ephemeral: true });
+        await session.log(text);
     } catch (err) {
-        // This is the only passive channel to the user, so a failure here is silence.
+        // Nothing renders in this host anyway, so a failure here costs the transcript record.
         debug(`say failed: ${err?.message ?? err}`);
     }
 }
