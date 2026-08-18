@@ -523,6 +523,42 @@ arrives on the next turn rather than as the tool's own result.
 This should be reverted if the CLI stops wedging, since the in-handler version gave the verdict a
 turn earlier.
 
+## Getting text in front of the user
+
+`session.log(text)` renders **nothing** in this host. Not at `info`, not at `warning`, not at
+`error`. The flag that decides visibility is `ephemeral`:
+
+```js
+await session.log(text, { ephemeral: true });   // visible
+await session.log(text);                        // goes to the timeline; nobody sees it
+```
+
+This cost four failed attempts to find, because the failure is completely silent — the call
+returns without throwing and simply does nothing. Three hypotheses about *when* logging works
+(only at startup, only inside a live turn, only outside one) were all wrong; an announcement
+logged from `onAgentStop` inside a live turn, on the same code path as an approval dialog that
+appeared correctly, was still invisible. The single message that had always been visible,
+`self-learn ready`, turned out to be the only one that passed the flag.
+
+The whole user-visible surface, enumerated rather than guessed:
+
+| Surface | Passive? | Renders? |
+|---|---|---|
+| `session.log(…, { ephemeral: true })` | yes | **yes** |
+| `session.log(…)` any level | yes | no |
+| `session.ui.confirm` / `select` / `input` / `elicitation` | no — demands an answer | yes |
+
+So `say()` is the only way to tell the user something without interrupting them, and every
+user-facing message goes through it. The one deliberate exception is the `logToTimeline` record,
+which is meant to be durable rather than seen.
+
+**Severity must never be carried in `level`.** The host turns any `session.error` whose
+`errorType` is not `model_call` into a *terminal* fault: it sets `hasError`, stops autopilot with
+reason "error", and marks the session failed. Four call sites here logged failed drafts at
+`level: "error"`, so reporting that a draft could not be written could end the session it was
+reporting to. This is the same defect the companion `advisor` extension hit and fixed; severity
+now lives in the message text.
+
 ## The approval dialog must stay inside a turn
 
 `session.ui.confirm` is an MCP elicitation. Raising one **after** the turn has ended puts the app

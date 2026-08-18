@@ -230,6 +230,27 @@ function debug(message) {
     }
 }
 
+// The only channel that puts text in front of the user without asking them to click something.
+//
+// `ephemeral: true` is load-bearing, not a detail. Without it this host renders nothing at any
+// level — measured: an announcement logged from `onAgentStop` inside a live turn returned without
+// throwing and was invisible, as were the same calls from `session.idle`. The one message that was
+// always visible, "self-learn ready", is the one that happened to pass this flag. `session.ui` is
+// the only other user-visible surface and every member of it (elicitation, confirm, select, input)
+// demands an answer, so this is the whole of the passive channel.
+//
+// Severity belongs in the text, never in `level`. The host turns any `session.error` whose
+// errorType is not `model_call` into a *terminal* fault: it sets `hasError`, stops autopilot with
+// reason "error" and marks the session failed. Reporting a failed draft is not a session failure.
+async function say(text) {
+    try {
+        await session.log(text, { ephemeral: true });
+    } catch (err) {
+        // This is the only passive channel to the user, so a failure here is silence.
+        debug(`say failed: ${err?.message ?? err}`);
+    }
+}
+
 function truncate(text, limit) {
     const str = typeof text === "string" ? text : JSON.stringify(text ?? "");
     return str.length <= limit ? str : `${str.slice(0, limit)}\n…[truncated ${str.length - limit} chars]`;
@@ -846,6 +867,9 @@ async function screen(session, { force = false, lookback = 0 } = {}) {
         state.hits++;
         debug(`verdict: LEARN ${verdict.target} "${verdict.skill}" — ${verdict.rationale}`);
         if (cfg("logToTimeline")) {
+            // The one call that deliberately bypasses `say`: this is a durable timeline record, not
+            // an announcement, so it must NOT be ephemeral. The cost is that this host shows it to
+            // nobody — a hit is surfaced to the user by the approval dialog instead.
             await session.log(
                 `self-learn: would ${verdict.target} skill "${verdict.skill}" — ${verdict.rationale}`,
             );
@@ -1178,9 +1202,8 @@ async function resolvePendingProposal(session) {
         persistPendingProposal(session);
         state.resolvingProposal = false;
         debug(`discarding proposal "${p.name}" after ${p.attempts - 1} failed attempts`);
-        await session.log(
+        await say(
             `self-learn: giving up on proposal "${p.name}" after repeated failures — ${state.lastError ?? "unknown error"}`,
-            { level: "error" },
         );
         return "abandoned";
     }
@@ -1202,7 +1225,7 @@ async function resolvePendingProposal(session) {
             // Unwritable by construction — retrying cannot help.
             state.lastError = `path check failed: ${err?.message ?? err}`;
             discard(state.lastError);
-            await session.log(`self-learn: rejected proposal — ${state.lastError}`, { level: "error" });
+            await say(`self-learn: rejected proposal — ${state.lastError}`);
             return "abandoned";
         }
 
@@ -1287,7 +1310,7 @@ ${filesNote}${backupNote}${pathNote}${disabledNote}\n\nWrite it?`;
         if (!approved) {
             recordDecline({ name: p.name, why: p.why, by: "user" });
             discard("declined by user");
-            await session.log(`self-learn: discarded proposal for "${p.name}"`);
+            await say(`self-learn: discarded proposal for "${p.name}"`);
             return "declined";
         }
 
@@ -1296,15 +1319,12 @@ ${filesNote}${backupNote}${pathNote}${disabledNote}\n\nWrite it?`;
             const file = await writeSkill(session, p);
             discard("written");
             state.written++;
-            await session.log(`self-learn: wrote ${file}`);
+            await say(`self-learn: wrote ${file}`);
         } catch (err) {
             // Kept so a transient failure (locked file, transient FS error) can be retried.
             state.lastError = `write failed: ${err?.message ?? err}`;
             debug(`${state.lastError} — proposal "${p.name}" retained for retry`);
-            await session.log(
-                `self-learn: write failed, proposal kept — ${state.lastError}`,
-                { level: "error" },
-            );
+            await say(`self-learn: write failed, proposal kept — ${state.lastError}`);
             outcome = "retained";
         }
         return outcome;
@@ -1753,12 +1773,8 @@ const session = await joinSession({
             if (state.pendingAnnouncement) {
                 const text = state.pendingAnnouncement;
                 state.pendingAnnouncement = null;
-                try {
-                    await session.log(text);
-                    debug(`announced: ${text}`);
-                } catch (err) {
-                    debug(`announcement failed: ${err?.message ?? err}`);
-                }
+                await say(text);
+                debug(`announced: ${text}`);
             }
             // Read-only check, for the log line only: `resolvePendingProposal` owns this flag and
             // clears it in its own `finally`. Setting it here would make that function's own
@@ -1801,7 +1817,7 @@ const session = await joinSession({
             description: "Show self-learn status",
             handler: async () => {
                 const v = state.lastVerdict;
-                await session.log(
+                await say(
                     [
                         "self-learn status",
                         `enabled:        ${cfg("enabled")}`,
@@ -1823,27 +1839,27 @@ const session = await joinSession({
             name: "learn-now",
             description: "Screen recent activity now, and draft a skill if there is something to learn",
             handler: async () => {
-                await session.log("self-learn: screening recent activity…", { ephemeral: true });
+                await say("self-learn: screening recent activity…");
                 const verdict = await screenAndDraft(session, { force: true, lookback: 600 });
 
                 if (verdict?.error) {
-                    await session.log(`self-learn: ${verdict.error}`, { level: "error" });
+                    await say(`self-learn: ${verdict.error}`);
                     return;
                 }
                 if (!verdict?.worthLearning) {
                     const why = verdict?.reason ?? verdict?.skipped;
-                    await session.log(`self-learn: nothing worth learning${why ? ` (${why})` : ""}`);
+                    await say(`self-learn: nothing worth learning${why ? ` (${why})` : ""}`);
                     return;
                 }
                 if (!cfg("write")) {
-                    await session.log("self-learn: write is disabled; nothing drafted");
+                    await say("self-learn: write is disabled; nothing drafted");
                     return;
                 }
                 // A held draft is announced by `screenAndDraft` itself, on every path. Only the
                 // failure needs saying here, since an explicitly requested review that produces
                 // nothing should not look like it silently did nothing.
                 if (!state.pendingProposal) {
-                    await session.log(
+                    await say(
                         `self-learn: found a lesson for "${verdict.skill}" but could not draft it${state.lastError ? ` (${state.lastError})` : ""}`,
                     );
                 }
@@ -1855,7 +1871,7 @@ const session = await joinSession({
             handler: async () => {
                 dumpDeliveredTypes();
                 const rows = [...deliveredTypes.entries()].sort((a, b) => b[1] - a[1]);
-                await session.log(
+                await say(
                     `delivered event types (${rows.length}):\n` +
                         rows.map(([k, n]) => `  ${k} = ${n}`).join("\n"),
                 );
@@ -1866,13 +1882,13 @@ const session = await joinSession({
             description: "Discard the pending self-learn proposal without writing it",
             handler: async () => {
                 if (!state.pendingProposal) {
-                    await session.log("self-learn: no pending proposal");
+                    await say("self-learn: no pending proposal");
                     return;
                 }
                 const name = state.pendingProposal.name;
                 state.pendingProposal = null;
                 persistPendingProposal(session);
-                await session.log(`self-learn: discarded pending proposal "${name}"`);
+                await say(`self-learn: discarded pending proposal "${name}"`);
             },
         },
         {
@@ -1880,7 +1896,7 @@ const session = await joinSession({
             description: "Disable self-learn for this session",
             handler: async () => {
                 state.sessionOverrides.enabled = false;
-                await session.log("self-learn: disabled");
+                await say("self-learn: disabled");
             },
         },
         {
@@ -1888,7 +1904,7 @@ const session = await joinSession({
             description: "Enable self-learn for this session",
             handler: async () => {
                 state.sessionOverrides.enabled = true;
-                await session.log("self-learn: enabled");
+                await say("self-learn: enabled");
             },
         },
     ],
@@ -2022,11 +2038,10 @@ session.on("session.idle", (event) => {
     })().catch((err) => debug(`idle handler threw: ${err?.message ?? err}`));
 });
 
-await session.log(
+await say(
     `self-learn ready — review on request` +
         (cfg("autoScreen") ? `, and automatically after >=${cfg("minToolCalls")} tool calls` : "") +
         (state.pendingProposal
             ? `; restored pending proposal "${state.pendingProposal.name}"`
             : ""),
-    { ephemeral: true },
 );
