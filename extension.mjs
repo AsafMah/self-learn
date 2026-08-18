@@ -1136,6 +1136,13 @@ async function screenAndDraft(session, opts = {}) {
         `draft held: ${result.proposal.mode} "${result.proposal.name}" — ` +
             `awaiting the next main-agent stop`,
     );
+    // Announced rather than merely logged to file. Drafting now happens entirely inside sub-agents,
+    // so without this the first the user hears of a lesson is the approval dialog, a turn later.
+    // Deliberately silent on a miss: most screenings are negative, and narrating them would be noise.
+    await session.log(
+        `self-learn: drafted ${result.proposal.mode} "${result.proposal.name}" — ` +
+            `you will be asked to approve it when this turn ends`,
+    );
     return verdict;
 }
 
@@ -1814,11 +1821,14 @@ const session = await joinSession({
                     await session.log("self-learn: write is disabled; nothing drafted");
                     return;
                 }
-                await session.log(
-                    state.pendingProposal
-                        ? `self-learn: drafted ${state.pendingProposal.mode} "${state.pendingProposal.name}" — you will be asked to approve it when this turn ends`
-                        : `self-learn: found a lesson for "${verdict.skill}" but could not draft it${state.lastError ? ` (${state.lastError})` : ""}`,
-                );
+                // A held draft is announced by `screenAndDraft` itself, on every path. Only the
+                // failure needs saying here, since an explicitly requested review that produces
+                // nothing should not look like it silently did nothing.
+                if (!state.pendingProposal) {
+                    await session.log(
+                        `self-learn: found a lesson for "${verdict.skill}" but could not draft it${state.lastError ? ` (${state.lastError})` : ""}`,
+                    );
+                }
             },
         },
         {
