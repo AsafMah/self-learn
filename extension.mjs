@@ -1980,10 +1980,16 @@ session.on("session.idle", (event) => {
             const { lookback } = state.reviewRequested;
             state.reviewRequested = null;
             const verdict = await screenAndDraft(session, { force: true, lookback });
+            // Announced, not just logged to file. A hit is announced by `screenAndDraft`; the
+            // misses are announced here because the user asked for this review explicitly, and
+            // answering an explicit request with silence looks identical to nothing having run.
+            // The automatic path stays quiet on a miss, where most screenings are negative.
             if (verdict?.error) {
-                debug(`requested review failed: ${verdict.error}`);
+                await session.log(`self-learn: review failed — ${verdict.error}`);
             } else if (!verdict?.worthLearning) {
-                debug(`requested review: nothing worth learning (${verdict?.reason ?? verdict?.skipped ?? "no reason"})`);
+                await session.log(
+                    `self-learn: nothing worth learning (${verdict?.reason ?? verdict?.skipped ?? "no reason given"})`,
+                );
             }
             return;
         }
