@@ -1768,11 +1768,17 @@ const session = await joinSession({
         // and while the turn is still live, which is exactly what an elicitation needs — resolving
         // one after the turn has ended leaves the app wedged showing "running" with no turn left
         // to finish.
-        onAgentStop: async (input) => {
+        onAgentStop: async (input, invocation) => {
             // The hook documents itself as top-level only, but sub-agent stops arrive here too,
-            // carrying their own `bg-<uuid>` session id. Unfiltered, the extension's own screener
-            // and drafter would each trigger one.
-            if (!isMainAgentStop(input, session.sessionId)) {
+            // carrying their own session id. Unfiltered, the extension's own screener and drafter
+            // would each trigger one.
+            //
+            // Compared against `invocation.sessionId` rather than `session.sessionId`: these hooks
+            // are declared inside the `joinSession({...})` call whose result initialises `session`,
+            // so reading `session` from a hook body is a temporal-dead-zone reference that happens
+            // to work only because hooks fire after the assignment completes. `invocation` carries
+            // the main session id with no such dependency; `session` remains as a fallback.
+            if (!isMainAgentStop(input, invocation?.sessionId ?? session.sessionId)) {
                 debug(`ignored agentStop from sub-agent ${input?.sessionId}`);
                 return;
             }

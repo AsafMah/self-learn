@@ -347,10 +347,15 @@ export function parseDraft(raw, verdict) {
 // Whether an `onAgentStop` hook firing belongs to the main agent.
 //
 // The hook documents itself as top-level only, but measured behaviour disagrees: a sub-agent's
-// stop arrives with `input.sessionId` set to that agent's own `bg-<uuid>` while
-// `invocation.sessionId` stays the main session id. Without this guard the extension's own
-// screener and drafter would each trigger another stop, and self-learn would once again be
-// running against sub-agents.
+// stop arrives with `input.sessionId` set to that agent's own id while `invocation.sessionId`
+// stays the main session id. Without this guard the extension's own screener and drafter would
+// each trigger another stop, and self-learn would once again be running against sub-agents.
+//
+// That sub-agent id has two shapes, so this compares for equality against the main session id
+// rather than pattern-matching a prefix: an RPC-started agent (what self-learn starts) reports
+// `bg-<uuid>`, while a `task`-tool sub-agent reports its own tool call id, `toolu_<id>`. Both
+// appear in this machine's log, correctly filtered. A `bg-` prefix test would silently let every
+// `task`-tool sub-agent through.
 export function isMainAgentStop(input, mainSessionId) {
     const id = input?.sessionId;
     if (typeof id !== "string" || id === "") return false;
