@@ -220,11 +220,17 @@ async function isSubAgentPrompt(prompt) {
     return false;
 }
 
+// Every session on the machine appends to this one file, so an unattributed line is close to
+// useless: three separate investigations here stalled on being unable to tell which session's
+// screener produced a verdict. Set once the session exists — `debug` runs before that, so it
+// cannot reach `session` directly without tripping the temporal dead zone.
+let sessionTag = "";
+
 function debug(message) {
     const path = cfg("debugLog");
     if (!path) return;
     try {
-        appendFileSync(path, `${new Date().toISOString()} ${message}\n`);
+        appendFileSync(path, `${new Date().toISOString()} ${sessionTag}${message}\n`);
     } catch {
         // Logging must never break the reflection loop.
     }
@@ -2041,6 +2047,8 @@ session.on("session.idle", (event) => {
         await screenAndDraft(session);
     })().catch((err) => debug(`idle handler threw: ${err?.message ?? err}`));
 });
+
+sessionTag = `[${String(session.sessionId ?? "?").slice(0, 8)}] `;
 
 await say(
     `self-learn ready — review on request` +
