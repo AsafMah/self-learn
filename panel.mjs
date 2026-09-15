@@ -8,8 +8,39 @@ const assets = new Map([
     ["panel-client.mjs", ["text/javascript; charset=utf-8", readFileSync(new URL("./panel-client.mjs", import.meta.url))]],
 ]);
 
+function readSettings(request) {
+    return new Promise((resolve, reject) => {
+        let size = 0;
+        const chunks = [];
+        request.on("data", (chunk) => {
+            size += chunk.length;
+            if (size > 2048) {
+                reject(Object.assign(new Error("Settings request is too large"), { statusCode: 413 }));
+                return;
+            }
+            chunks.push(chunk);
+        });
+        request.once("error", reject);
+        request.once("aborted", () => reject(new Error("Settings request aborted")));
+        request.once("end", () => {
+            if (size > 2048) return;
+            try {
+                const value = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+                if (!value || Array.isArray(value) ||
+                    Object.keys(value).length !== 2 ||
+                    typeof value.enabled !== "boolean" || typeof value.expectedEnabled !== "boolean") {
+                    throw new Error("Expected only enabled and expectedEnabled boolean values");
+                }
+                resolve(value);
+            } catch (error) {
+                reject(Object.assign(error, { statusCode: 400 }));
+            }
+        });
+    });
+}
+
 // Adapted from the SDK canvas scaffold: one loopback server per open instance.
-export function createActivityPanel({ getSnapshot, onError, intervalMs = 1000 }) {
+export function createActivityPanel({ getSnapshot, applySettings, onError, intervalMs = 1000 }) {
     const servers = new Map();
 
     async function startServer() {
@@ -57,16 +88,44 @@ export function createActivityPanel({ getSnapshot, onError, intervalMs = 1000 })
                 response.writeHead(403).end("Forbidden");
                 return;
             }
-            if (request.method !== "GET") {
-                response.writeHead(405, { Allow: "GET" }).end("Read-only panel");
-                return;
-            }
             const path = request.url;
             if (!path?.startsWith(prefix)) {
                 response.writeHead(404).end("Not found");
                 return;
             }
             const route = path.slice(prefix.length);
+            if (request.method === "POST" && route === "settings") {
+                if (request.headers.origin !== origin) {
+                    response.writeHead(403, { "Content-Type": "application/json" })
+                        .end(JSON.stringify({ applied: false, error: "An own-origin request is required" }));
+                    return;
+                }
+                if (request.headers["content-type"]?.split(";")[0].trim() !== "application/json") {
+                    response.writeHead(415, { "Content-Type": "application/json" })
+                        .end(JSON.stringify({ applied: false, error: "Expected application/json" }));
+                    return;
+                }
+                request.setTimeout(10000, () => request.destroy());
+                void readSettings(request).then((settings) => {
+                    if (!applySettings) throw Object.assign(new Error("Settings changes are unavailable"), { statusCode: 503 });
+                    return applySettings(settings);
+                }).then((message) => {
+                    if (response.destroyed || response.writableEnded) return;
+                    response.writeHead(200, { "Content-Type": "application/json" })
+                        .end(JSON.stringify({ ...envelope(), applied: true, message }));
+                }).catch((error) => {
+                    const code = [400, 409, 413, 503].includes(error.statusCode) ? error.statusCode : 500;
+                    if (code === 500) onError(error);
+                    if (response.destroyed || response.writableEnded) return;
+                    response.writeHead(code, { "Content-Type": "application/json" })
+                        .end(JSON.stringify({ applied: code === 500 ? null : false, error: error.message }));
+                });
+                return;
+            }
+            if (request.method !== "GET") {
+                response.writeHead(405, { Allow: "GET" }).end("Method not allowed");
+                return;
+            }
             if (assets.has(route)) {
                 const [type, body] = assets.get(route);
                 response.setHeader("Content-Security-Policy",
@@ -91,6 +150,7 @@ export function createActivityPanel({ getSnapshot, onError, intervalMs = 1000 })
                         client.pending = null;
                         send(response, frame);
                     }
+
                 });
                 send(response, `data: ${JSON.stringify(envelope())}\n\n`);
                 if (!timer && clients.size) {
@@ -144,7 +204,7 @@ export function createActivityPanel({ getSnapshot, onError, intervalMs = 1000 })
         declaration: {
             id: "self-learn-activity",
             displayName: "Self-learn activity",
-            description: "Live self-learn status, pending-proposal summary and recent activity for this session.",
+            description: "Live self-learn activity, pending-proposal summary and confirmed session enable/disable settings.",
             inputSchema: { type: "object", properties: {}, additionalProperties: false },
             actions: [{
                 name: "refresh",

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { boot } from "./test-support/host.mjs";
 
-test("the shipped extension registers its read-only activity canvas and shared status", async (t) => {
+test("the shipped extension registers its read-only activity action and shared status", async (t) => {
     const host = await boot(t);
     const canvas = host.options.canvases[0];
     assert.equal(canvas.id, "self-learn-activity");
@@ -106,4 +106,35 @@ test("own canvas queries do not count as work worth auto-screening", async (t) =
     assert.equal(canvas.actions[0].handler().status.toolCallsThisTurn, 0);
     host.emit({ type: "tool.execution_start", data: { toolName: "view", arguments: {} } });
     assert.equal(canvas.actions[0].handler().status.toolCallsThisTurn, 1);
+});
+
+test("canvas settings share the session helper but never open an agent dialog or queue a review", async (t) => {
+    const host = await boot(t);
+    const canvas = host.options.canvases[0];
+    host.openInstances = ["settings"];
+    const { url } = await canvas.open({ instanceId: "settings" });
+    const post = (enabled, expectedEnabled) => fetch(url + "settings", {
+        method: "POST", headers: { Origin: new URL(url).origin, "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled, expectedEnabled }),
+    });
+    const result = await post(false, true);
+    assert.equal(result.status, 200);
+    assert.match(await host.tool("status"), /enabled: false/);
+    assert.equal(host.confirmations.length, 0);
+    assert.equal(canvas.actions[0].handler().status.reviewQueued, false);
+    assert.equal(canvas.actions[0].handler().status.screenedTurns, 0);
+    assert.ok(canvas.actions[0].handler().entries.some((entry) => entry.message.endsWith("(canvas)")));
+    assert.equal((await post(true, true)).status, 409);
+    assert.match(await host.tool("status"), /enabled: false/);
+    await host.tool("enable");
+    assert.equal(host.confirmations.length, 1);
+    assert.match(await host.tool("status"), /enabled: true/);
+    let finish;
+    host.confirmationHandler = () => new Promise((resolve) => { finish = resolve; });
+    const pending = host.tool("disable");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal((await post(false, true)).status, 409);
+    assert.equal(canvas.actions[0].handler().status.enabled, true);
+    finish(false);
+    assert.equal((await pending).resultType, "rejected");
 });

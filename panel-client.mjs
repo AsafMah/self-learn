@@ -47,32 +47,136 @@ export function renderSnapshot(document, snapshot) {
 
 if (typeof document !== "undefined") {
     let snapshot;
+    let dirty = false;
+    let expectedEnabled;
+    let candidate = null;
+    let applying = false;
+    let outcomeUnknown = false;
     const connection = document.getElementById("connection");
     const error = document.getElementById("error");
+    const enabled = document.getElementById("enabled");
+    const review = document.getElementById("review-setting");
+    const reset = document.getElementById("reset-setting");
+    const confirmation = document.getElementById("setting-confirmation");
+    const resultText = document.getElementById("setting-result");
+    const resetForm = () => {
+        dirty = false;
+        candidate = null;
+        confirmation.hidden = true;
+        reset.hidden = true;
+        document.getElementById("apply-setting").disabled = applying || outcomeUnknown;
+        if (snapshot) {
+            expectedEnabled = snapshot.status.enabled;
+            enabled.checked = expectedEnabled;
+        }
+    };
     const display = (result) => {
         if (result.error) throw new Error(result.error);
         snapshot = result.snapshot;
         renderSnapshot(document, snapshot);
         error.hidden = true;
+        if (!dirty && !applying) resetForm();
+        enabled.disabled = applying || outcomeUnknown;
+        review.disabled = applying || outcomeUnknown;
     };
     const failed = (message) => {
         error.textContent = message;
         error.hidden = false;
     };
-    async function refresh() {
+    async function refresh(recoverUnknown = false) {
         const button = document.getElementById("refresh");
         button.disabled = true;
         try {
             const response = await fetch("./state", { cache: "no-store" });
             if (!response.ok) throw new Error(`Status request failed (${response.status})`);
-            display(await response.json());
+            const result = await response.json();
+            if (recoverUnknown && outcomeUnknown && result.snapshot && !result.error) {
+                outcomeUnknown = false;
+                dirty = false;
+                resetForm();
+                resultText.textContent = "Current setting refreshed. Review a new change if needed.";
+            }
+            display(result);
         } catch (failure) {
             failed(failure.message);
         } finally {
             button.disabled = false;
         }
     }
-    document.getElementById("refresh").addEventListener("click", refresh);
+    document.getElementById("refresh").addEventListener("click", () => refresh(true));
+    enabled.addEventListener("change", () => {
+        dirty = true;
+        candidate = null;
+        confirmation.hidden = true;
+        reset.hidden = false;
+        resultText.textContent = "";
+    });
+    document.getElementById("settings").addEventListener("submit", (event) => {
+        event.preventDefault();
+        if (!snapshot || applying || outcomeUnknown) return;
+        if (enabled.checked === snapshot.status.enabled) {
+            resetForm();
+            resultText.textContent = "This setting already has that value. Nothing changed.";
+            return;
+        }
+        candidate = { enabled: enabled.checked, expectedEnabled };
+        document.getElementById("setting-summary").textContent =
+            `${candidate.enabled ? "Enable" : "Disable"} self-learn for this session? No config file, running review or pending proposal will be changed.`;
+        confirmation.hidden = false;
+    });
+    const cancel = () => {
+        if (applying) return;
+        if (outcomeUnknown) {
+            candidate = null;
+            confirmation.hidden = true;
+            reset.hidden = true;
+            return;
+        }
+        resetForm();
+        resultText.textContent = "Edit cancelled. No new change applied.";
+    };
+    reset.addEventListener("click", cancel);
+    document.getElementById("cancel-setting").addEventListener("click", cancel);
+    document.getElementById("apply-setting").addEventListener("click", async () => {
+        if (!candidate || applying || outcomeUnknown) return;
+        applying = true;
+        enabled.disabled = true;
+        review.disabled = true;
+        document.getElementById("apply-setting").disabled = true;
+        document.getElementById("cancel-setting").disabled = true;
+        try {
+            const response = await fetch("./settings", {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(candidate),
+            });
+            const result = await response.json();
+            if (!response.ok || result.applied !== true) {
+                if (result.applied === false) {
+                    resultText.textContent = `Not applied: ${result.error || "Request rejected"}`;
+                    return;
+                }
+                throw new Error(result.error || `Settings request failed (${response.status})`);
+            }
+            const desired = candidate.enabled;
+            dirty = false;
+            candidate = null;
+            confirmation.hidden = true;
+            reset.hidden = true;
+            expectedEnabled = desired;
+            enabled.checked = desired;
+            if (result.snapshot && !result.error) display(result);
+            resultText.textContent = result.message + (result.error ? ` Status could not refresh: ${result.error}` : "");
+        } catch (failure) {
+            outcomeUnknown = true;
+            resultText.textContent = `Could not confirm the outcome: ${failure.message}. Refresh before trying again.`;
+        } finally {
+            applying = false;
+            enabled.disabled = outcomeUnknown;
+            review.disabled = outcomeUnknown;
+            document.getElementById("apply-setting").disabled = outcomeUnknown;
+            document.getElementById("cancel-setting").disabled = false;
+        }
+    });
     for (const id of ["kind", "search"]) {
         document.getElementById(id).addEventListener("input", () => {
             if (snapshot) renderSnapshot(document, snapshot);

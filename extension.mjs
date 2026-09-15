@@ -1516,10 +1516,10 @@ function statusText() {
     ].join("\n");
 }
 
-function setEnabled(enabled) {
+function setEnabled(enabled, source) {
     state.sessionOverrides.enabled = enabled;
     const text = `self-learn ${enabled ? "enabled" : "disabled"} for this session`;
-    debug(text);
+    debug(text + (source === "canvas" ? " (canvas)" : ""));
     return text;
 }
 
@@ -1572,6 +1572,15 @@ function activitySnapshot() {
 
 const activityPanel = createActivityPanel({
     getSnapshot: activitySnapshot,
+    applySettings: ({ enabled, expectedEnabled }) => {
+        if (state.confirmingControl || state.resolvingProposal) {
+            throw Object.assign(new Error("Another confirmation is open. Nothing changed; try again after it closes."), { statusCode: 409 });
+        }
+        if (cfg("enabled") !== expectedEnabled) {
+            throw Object.assign(new Error("The setting changed while you were editing. Reset the form and review again."), { statusCode: 409 });
+        }
+        return setEnabled(enabled, "canvas");
+    },
     onError: (error) => debug(`activity panel error: ${error.message}`),
 });
 

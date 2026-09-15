@@ -28,6 +28,25 @@
       <p id="pending"></p>
       <p id="last-error" class="error" hidden></p>
     </section>
+    <section aria-labelledby="settings-title">
+      <h2 id="settings-title">Session settings</h2>
+      <form id="settings">
+        <label class="toggle"><input id="enabled" type="checkbox" disabled> Enable self-learn</label>
+        <p class="muted">Changes affect this session only, not your config file. Disabling does not cancel a running review or clear a pending proposal.</p>
+        <div class="settings-buttons">
+          <button id="review-setting" type="submit" disabled>Review change</button>
+          <button id="reset-setting" type="button" hidden>Reset</button>
+        </div>
+      </form>
+      <div id="setting-confirmation" class="confirmation" hidden>
+        <p id="setting-summary"></p>
+        <div class="settings-buttons">
+          <button id="apply-setting" type="button">Apply change</button>
+          <button id="cancel-setting" type="button">Cancel</button>
+        </div>
+      </div>
+      <p id="setting-result" role="status" aria-live="polite"></p>
+    </section>
     <section aria-labelledby="activity-title">
       <div class="activity-heading"><h2 id="activity-title">Recent activity</h2><span id="count" class="muted"></span></div>
       <div class="filters">
@@ -46,7 +65,7 @@
       <ol id="entries" aria-label="Activity, newest first"></ol>
     </section>
     <footer>
-      <p>This panel is read-only. Ask the agent for a self-learn review, status, or to enable/disable it. Skill writes still require the existing approval dialog.</p>
+      <p>Settings require confirmation here. Ask the agent to request a review; skill writes still require the existing approval dialog.</p>
       <p id="session" class="muted"></p>
     </footer>
   </main>

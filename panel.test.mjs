@@ -21,10 +21,21 @@ function snapshot() {
 async function fixture(t) {
     const state = snapshot();
     const errors = [];
-    const panel = createActivityPanel({ getSnapshot: () => state, onError: (error) => errors.push(error), intervalMs: 20 });
+    const changes = [];
+    const panel = createActivityPanel({
+        getSnapshot: () => state, onError: (error) => errors.push(error), intervalMs: 20,
+        applySettings(change) {
+            if (change.expectedEnabled !== state.status.enabled) {
+                throw Object.assign(new Error("Setting changed elsewhere"), { statusCode: 409 });
+            }
+            changes.push(change);
+            state.status.enabled = change.enabled;
+            return "Setting applied";
+        },
+    });
     t.after(() => panel.dispose());
     const opened = await panel.declaration.open({ instanceId: "one" });
-    return { panel, state, errors, url: opened.url };
+    return { panel, state, errors, changes, url: opened.url };
 }
 
 test("open coalesces concurrent calls; panels share data, not lifetimes", async (t) => {
@@ -48,7 +59,7 @@ test("open coalesces concurrent calls; panels share data, not lifetimes", async 
     assert.equal((await (await fetch(reopened.url + "state")).json()).snapshot.status.phase, "Reviewing");
 });
 
-test("HTTP is loopback, read-only, capability-scoped and rejects foreign origins/hosts", async (t) => {
+test("HTTP reads are capability-scoped and reject foreign origins/hosts", async (t) => {
     const { url } = await fixture(t);
     const base = new URL(url).origin;
     assert.equal(new URL(url).hostname, "127.0.0.1");
@@ -73,6 +84,50 @@ test("HTTP is loopback, read-only, capability-scoped and rejects foreign origins
         request.on("error", reject);
     });
     assert.equal(result, 403);
+});
+
+test("settings writes validate origin, content, byte budget and expected baseline", async (t) => {
+    const { url, changes, state } = await fixture(t);
+    const origin = new URL(url).origin;
+    const body = JSON.stringify({ enabled: false, expectedEnabled: true });
+    const send = (text, headers = {}) => fetch(url + "settings", {
+        method: "POST", headers: { Origin: origin, "Content-Type": "application/json", ...headers }, body: text,
+    });
+    assert.equal((await fetch(url + "settings", { method: "POST", headers: { "Content-Type": "application/json" }, body })).status, 403);
+    assert.equal((await send(body, { Origin: "https://unrelated.example" })).status, 403);
+    assert.equal((await send(body, { "Content-Type": "text/plain" })).status, 415);
+    for (const invalid of ['{}', 'null', '[]', '{"enabled":"false","expectedEnabled":true}',
+        '{"enabled":false,"expectedEnabled":true,"file":"elsewhere"}', 'not json']) {
+        assert.equal((await send(invalid)).status, 400);
+    }
+    assert.equal((await send("x".repeat(4096))).status, 413);
+    assert.equal(changes.length, 0);
+    const applied = await send(body);
+    assert.equal(applied.status, 200);
+    assert.equal((await applied.json()).applied, true);
+    assert.equal(state.status.enabled, false);
+    assert.equal(changes.length, 1);
+    const stale = await send(body);
+    assert.equal(stale.status, 409);
+    assert.equal((await stale.json()).applied, false);
+    assert.equal(changes.length, 1);
+});
+
+test("a failed read after applying a setting is not reported as an unapplied change", async (t) => {
+    let changed = false;
+    const panel = createActivityPanel({
+        getSnapshot() { if (changed) throw new Error("read failed"); return snapshot(); },
+        applySettings() { changed = true; return "Setting applied"; }, onError: () => {},
+    });
+    t.after(() => panel.dispose());
+    const { url } = await panel.declaration.open({ instanceId: "outcome" });
+    const response = await fetch(url + "settings", {
+        method: "POST", headers: { Origin: new URL(url).origin, "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: false, expectedEnabled: true }),
+    });
+    const result = await response.json();
+    assert.equal(result.applied, true);
+    assert.match(result.error, /read failed/);
 });
 
 test("SSE delivers changed activity and close terminates its connections", async (t) => {

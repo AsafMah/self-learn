@@ -426,7 +426,7 @@ Ask the agent to **open Self-learn activity**. The extension declares the canvas
 `self-learn-activity`, independently of advisor. It is opened explicitly, not as an automatic
 popup or a synthetic user message.
 
-The read-only panel shows current review/drafting/approval state, enabled/model settings, counters
+The panel shows current review/drafting/approval state, enabled/model settings, counters
 since this extension loaded, and the pending proposal's name and mode. Recent reviews (including
 misses), drafts, saved skills and operational errors appear in a filterable, searchable feed. An
 open panel updates without an agent turn; disconnects are labelled stale rather than reporting
@@ -444,10 +444,20 @@ not silently overwritten; fresh events remain available in memory.
 
 The feed does not store the transcript or full draft bodies. Each instance serves only this
 session's snapshot from a random capability URL on loopback, without CORS, with host/origin
-checks and literal-text rendering. Closing it stops its server, streams and timer. The HTTP
-surface cannot start a review, toggle configuration, discard proposals or write skills.
-Use `self_learn_now` for controls; **every skill write still requires the existing approval
-dialog**, never a panel refresh or opening a pending proposal.
+checks and literal-text rendering. Closing it stops its server, streams and timer.
+
+The **Session settings** section can enable or disable self-learn for the running session. Editing
+the checkbox changes nothing until **Review change**, then **Apply change**; Cancel discards the
+edit. Confirmation stays inside the panel and starts no agent turn or idle-host dialog. The
+bounded JSON POST requires the panel's own origin and capability URL, validates the exact fields,
+and rejects a stale expected value or an already-open confirmation before changing state. A failed
+or disconnected response is not presented as proof that nothing happened: the panel reports an
+unknown outcome and disables resubmission until an explicit refresh succeeds. Cancel or Reset
+does not erase that warning or pretend to undo a submitted request. No global config file is edited.
+
+The panel cannot start a review, discard proposals or write skills. Use `self_learn_now` for those
+operations; **every skill write still requires the existing approval dialog**, never a panel
+refresh, setting change or opening a pending proposal.
 Tool-initiated enable/disable changes require a separate confirmation before mutation. Declining,
 cancelling or an unavailable dialog leaves the setting unchanged; status and activity reads never
 prompt. CLI `/learn-on` and `/learn-off` keep their existing direct-user behavior.
