@@ -283,8 +283,10 @@ ln -s ~/src/self-learn ~/.copilot/extensions/self-learn
 
 Then `/extensions reload`.
 
-The whole directory has to be linked, not just `extension.mjs`: it imports `./lib.mjs`, which holds
-the pure core.
+Link or install the whole directory, not just `extension.mjs`: its runtime includes `lib.mjs`,
+`activity.mjs`, `panel.mjs`, and the `panel.html`, `panel.css`, and `panel-client.mjs` assets.
+Installing files does not replace the code already loaded by a running extension process. Start a
+new session to load the installation, or reload explicitly when no background review is in flight.
 
 ### Tests
 
@@ -295,12 +297,25 @@ npm test
 `node --test`, built into Node — the repo has no dependencies, which matters here because
 `node_modules` would otherwise appear inside a directory the CLI loads as an extension.
 
-`extension.mjs` ends with a top-level `await joinSession(...)`, so importing it from a test would
-try to connect to the host. Everything worth testing is therefore in `lib.mjs`, which touches no
-session, config, or disk: byte budgets are passed in rather than read from config. The tests cover
-what has real invariants — that the rubric cannot be talked past, that a quote is checked against
-the transcript, that writes cannot escape the skill directory, that frontmatter cannot be broken out
-of, and that repeated extends keep the previous file as an exact byte prefix.
+Core tests cover rubric validation, verbatim quotes, write containment, frontmatter, and append-only
+growth. Activity tests exercise bounded persistence, corrupt-history recovery, real HTTP/SSE
+delivery, isolation and cleanup. `hooks.test.mjs` boots the actual extension with only the SDK
+specifier redirected to an isolated test host; it needs Node 22.15+ for `module.registerHooks`.
+No live session or personal config is used.
+
+For a real browser check, run `npm run test:browser` with an installed Chromium-based browser.
+Windows defaults to the standard Microsoft Edge path; set `BROWSER_EXECUTABLE` for another
+installation. The runner uses a disposable headless profile, checks live updates, filtering,
+untrusted-text rendering, narrow layout, disconnect and reopen, then closes its own browser.
+An optional output directory saves light and narrow/dark screenshots:
+
+```powershell
+npm run test:browser -- "$env:TEMP\self-learn-panel-preview"
+```
+
+This proves the renderer, not the app's canvas integration. In an app session that has loaded this
+checkout, use `list_canvas_capabilities`, `open_canvas`, and the `refresh` action, and verify the
+panel itself. Neither a successful RPC nor a recorded `session.info` event alone proves visibility.
 
 ### What the tests are worth, measured
 
@@ -380,14 +395,16 @@ First match wins: `$COPILOT_SELF_LEARN_CONFIG`, `<cwd>/.github/self-learn.json`,
 
 ## Commands and tools
 
-Extension slash commands only surface in the CLI's TUI. **The GitHub Copilot app does not show
-them**, so the same functionality is also exposed as a tool the agent can call, which works on
-both surfaces.
+Extension command completion is a CLI TUI capability. App support is tracked in
+[github/app#3056](https://github.com/github/app/issues/3056); use the agent tool when the app does not
+expose these commands, rather than assuming that a registered command appears in its composer.
 
 | Tool | Purpose |
 | --- | --- |
 | `self_learn_now` (`action: "review"`) | Queue a screening for the end of the turn; escalate on a hit. |
 | `self_learn_now` (`action: "status"`) | Counters and pending-proposal state. |
+| `self_learn_now` (`action: "activity"`) | Current status and the latest 25 retained activity entries. |
+| `self_learn_now` (`action: "enable"` / `"disable"`) | Toggle for this session, on the user's explicit request. |
 | `self_learn_now` (`action: "discard"`) | Drop the pending proposal without writing it. |
 | `self_learn_now` (`action: "events"`) | Which session event types have actually been delivered. |
 | `self_learn_now` (`action: "declines"`) | Lessons already refused, and the ledger's path. |
@@ -402,6 +419,35 @@ In the CLI TUI these are also available as slash commands:
 | `/learn-discard` | Drop the pending proposal without writing it. |
 | `/learn-events` | Dump which event types are actually delivered to extensions. |
 | `/learn-on` / `/learn-off` | Toggle for this session. |
+
+## Activity panel in the app
+
+Ask the agent to **open Self-learn activity**. The extension declares the canvas
+`self-learn-activity`, independently of advisor. It is opened explicitly, not as an automatic
+popup or a synthetic user message.
+
+The read-only panel shows current review/drafting/approval state, enabled/model settings, counters
+since this extension loaded, and the pending proposal's name and mode. Recent reviews (including
+misses), drafts, saved skills and operational errors appear in a filterable, searchable feed. An
+open panel updates without an agent turn; disconnects are labelled stale rather than reporting
+that the extension is still live. The agent-facing `refresh` action returns current status and
+the latest 25 entries; the panel itself can display all retained entries.
+
+Up to the latest 200 entries, within a 2 MiB serialized-history budget, are retained in
+`files/self-learn-activity-<session-id>.json` under the session workspace. Individual messages are
+capped at 4096 characters and marked when truncated; byte-heavy entries can reduce the retained count.
+Without a workspace, they live under `~/.copilot/self-learn/`. History starts when a build with this
+feature loads; it does not import the old machine-wide debug log. A new panel or an extension
+reload reuses the session's history, while counters and enabled overrides retain their existing
+in-memory lifecycle. Unreadable, corrupt or mismatched history is reported visibly and preserved,
+not silently overwritten; fresh events remain available in memory.
+
+The feed does not store the transcript or full draft bodies. Each instance serves only this
+session's snapshot from a random capability URL on loopback, without CORS, with host/origin
+checks and literal-text rendering. Closing it stops its server, streams and timer. The HTTP
+surface cannot start a review, toggle configuration, discard proposals or write skills.
+Use `self_learn_now` for controls; **every skill write still requires the existing approval
+dialog**, never a panel refresh or opening a pending proposal.
 
 ## Runtime findings
 
@@ -572,8 +618,10 @@ turn earlier.
 
 ## Getting text in front of the user
 
-**In the GitHub Copilot app, extension output currently does not render at all — and this is a
-regression in the app, which has happened before.** Asaf filed it as
+**The activity panel and agent tools do not depend on the app rendering `session.log()`.**
+The measurements below describe a historical app regression, tracked again in
+[github/app#3373](https://github.com/github/app/issues/3373). Check the current release rather than
+treating a historical observation as a permanent API limitation. The original report was
 [github/app#2765](https://github.com/github/app/issues/2765), *"Extensions who send `info` or
 `warning` level logs are not shown in the app"*, on Aug 11 at 12:57:14 against app `1.1.6`. It was
 closed COMPLETED and the release bot confirms it was **fixed in app v1.1.8** on Aug 12. The app here
@@ -637,9 +685,9 @@ never treated as a suspect, even though the transcript had shown all along that 
 being emitted and recorded exactly as intended. When output is correct at every layer you control,
 suspect the layer you do not.
 
-Consequences while it lasts: a **hit** is announced by the approval dialog (`session.ui`, which does
-still work), and a **miss** is not announced. The announcement path is deliberately *kept* rather
-than deleted, because the mechanism is correct and worked before app v1.1.10 — it will work again.
+The activity feed records both hits and misses independently of timeline rendering. Approval
+still uses `session.ui`. The timeline path is kept for CLI users and hosts that render it; the
+panel is not a claim that native app banners or extension slash commands have been repaired.
 
 ### What `ephemeral: true` actually does
 
