@@ -404,7 +404,7 @@ expose these commands, rather than assuming that a registered command appears in
 | `self_learn_now` (`action: "review"`) | Queue a screening for the end of the turn; escalate on a hit. |
 | `self_learn_now` (`action: "status"`) | Counters and pending-proposal state. |
 | `self_learn_now` (`action: "activity"`) | Current status and the latest 25 retained activity entries. |
-| `self_learn_now` (`action: "enable"` / `"disable"`) | Toggle for this session, on the user's explicit request. |
+| `self_learn_now` (`action: "enable"` / `"disable"`) | Toggle for this session after a confirmation dialog, on the user's explicit request. |
 | `self_learn_now` (`action: "discard"`) | Drop the pending proposal without writing it. |
 | `self_learn_now` (`action: "events"`) | Which session event types have actually been delivered. |
 | `self_learn_now` (`action: "declines"`) | Lessons already refused, and the ledger's path. |
@@ -448,6 +448,9 @@ checks and literal-text rendering. Closing it stops its server, streams and time
 surface cannot start a review, toggle configuration, discard proposals or write skills.
 Use `self_learn_now` for controls; **every skill write still requires the existing approval
 dialog**, never a panel refresh or opening a pending proposal.
+Tool-initiated enable/disable changes require a separate confirmation before mutation. Declining,
+cancelling or an unavailable dialog leaves the setting unchanged; status and activity reads never
+prompt. CLI `/learn-on` and `/learn-off` keep their existing direct-user behavior.
 
 ## Runtime findings
 

@@ -22,7 +22,7 @@ export async function boot(t) {
     const listeners = [];
     const logs = [];
     const host = {
-        root, logs,
+        root, logs, confirmations: [], confirmationResult: true,
         session: {
             sessionId: randomUUID(),
             workspacePath: root,
@@ -34,6 +34,14 @@ export async function boot(t) {
                 return () => listeners.splice(listeners.indexOf(fn), 1);
             },
             log: async (message) => { logs.push(message); },
+            ui: {
+                async confirm(message) {
+                    host.confirmations.push(message);
+                    if (host.confirmationError) throw host.confirmationError;
+                    if (host.confirmationHandler) return host.confirmationHandler(message);
+                    return host.confirmationResult;
+                },
+            },
         },
         emit(event) { for (const listener of listeners) listener(event); },
         tool(action, invocation = {}) {

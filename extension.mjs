@@ -118,6 +118,7 @@ const state = {
     reviewRequested: null,
     rejectedProposals: 0,
     resolvingProposal: false,
+    confirmingControl: false,
     // Announcements cannot be made from `session.idle`: screening finishes after the turn has
     // ended, and an extension log with no live turn to attach to renders nowhere. Measured twice —
     // the call succeeds, writes nothing, and the user sees silence. So the text is parked here and
@@ -1480,7 +1481,8 @@ function statusSnapshot() {
         autoScreen: cfg("autoScreen"),
         model: cfg("screenerModel"),
         agentType: cfg("agentType"),
-        phase: state.resolvingProposal ? "Approval in progress"
+        phase: state.confirmingControl ? "Control confirmation"
+            : state.resolvingProposal ? "Approval in progress"
             : state.draftingInFlight ? "Drafting"
             : state.screeningInFlight ? "Reviewing"
             : p ? "Proposal pending"
@@ -1519,6 +1521,33 @@ function setEnabled(enabled) {
     const text = `self-learn ${enabled ? "enabled" : "disabled"} for this session`;
     debug(text);
     return text;
+}
+
+async function confirmEnabledChange(enabled) {
+    const reject = (textResultForLlm) => ({ textResultForLlm, resultType: "rejected" });
+    if (state.confirmingControl || state.resolvingProposal) {
+        return reject("A self-learn confirmation is already open. Nothing changed.");
+    }
+    state.confirmingControl = true;
+    try {
+        const approved = await session.ui.confirm(
+            `${enabled ? "Enable" : "Disable"} self-learn for this session? This changes the running ` +
+            "session only; the configuration file is not modified. It does not cancel an ongoing " +
+            "review or clear a pending proposal.",
+        );
+        if (approved !== true) {
+            activity?.record("notice", "Self-learn setting change declined; nothing changed.");
+            return reject("The user declined or cancelled the self-learn setting change. Nothing changed.");
+        }
+        return setEnabled(enabled);
+    } catch (error) {
+        const message = `Self-learn setting confirmation failed: ${error?.message ?? error}. Nothing changed.`;
+        activity?.record("error", message);
+        debug(message);
+        return reject(message);
+    } finally {
+        state.confirmingControl = false;
+    }
 }
 
 function discardPending() {
@@ -1573,7 +1602,7 @@ const session = await joinSession({
                             "events: which session event types have actually been delivered. " +
                             "declines: lessons already refused, which the screener will not raise again. " +
                             "activity: recent session activity. enable/disable: change only this session, " +
-                            "when explicitly requested by the user.",
+                            "when explicitly requested by the user; a confirmation dialog is required.",
                     },
                 },
                 required: [],
@@ -1599,7 +1628,7 @@ const session = await joinSession({
                         (snapshot.storageError ? `\n\n${snapshot.storageError}` : "");
                 }
 
-                if (action === "enable" || action === "disable") return setEnabled(action === "enable");
+                if (action === "enable" || action === "disable") return confirmEnabledChange(action === "enable");
 
                 if (action === "events") {
                     const rows = [...deliveredTypes.entries()].sort((a, b) => b[1] - a[1]);

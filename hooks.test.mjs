@@ -26,9 +26,12 @@ test("the shipped extension registers its read-only activity canvas and shared s
 test("enable/disable tools share CLI behavior without starting a review", async (t) => {
     const host = await boot(t);
     assert.match(await host.tool("disable"), /disabled/);
+    assert.equal(host.confirmations.length, 1);
+    assert.match(host.confirmations[0], /Disable self-learn for this session/);
     assert.match(await host.tool("status"), /enabled: false/);
     await host.options.commands.find((command) => command.name === "learn-on").handler();
     assert.match(await host.tool("status"), /enabled: true/);
+    assert.equal(host.confirmations.length, 1);
     assert.match(await host.tool("activity"), /self-learn disabled for this session/);
     assert.equal(host.options.canvases[0].actions[0].handler().status.reviewQueued, false);
     assert.equal(host.options.canvases[0].actions[0].handler().status.screenedTurns, 0);
@@ -42,7 +45,40 @@ test("subagent calls cannot use new control or activity actions", async (t) => {
     for (const action of ["disable", "enable", "activity"]) {
         assert.equal((await host.tool(action, { toolCallId: "child-call" })).resultType, "rejected");
     }
+    assert.equal(host.confirmations.length, 0);
     assert.match(await host.tool("status"), /enabled: true/);
+});
+
+test("declined and unavailable control confirmations do not change settings", async (t) => {
+    const host = await boot(t);
+    host.confirmationResult = false;
+    assert.equal((await host.tool("disable")).resultType, "rejected");
+    assert.match(await host.tool("status"), /enabled: true/);
+    host.confirmationError = new Error("dialog unavailable");
+    const failed = await host.tool("disable");
+    assert.equal(failed.resultType, "rejected");
+    assert.match(failed.textResultForLlm, /Nothing changed/);
+    assert.match(await host.tool("status"), /enabled: true/);
+    host.confirmationError = null;
+    host.confirmationResult = true;
+    assert.match(await host.tool("disable"), /disabled/);
+    assert.match(await host.tool("enable"), /enabled/);
+    assert.match(await host.tool("status"), /enabled: true/);
+});
+
+test("only one setting confirmation is open, and no mutation precedes approval", async (t) => {
+    const host = await boot(t);
+    let finish;
+    host.confirmationHandler = () => new Promise((resolve) => { finish = resolve; });
+    const request = host.tool("disable");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(host.options.canvases[0].actions[0].handler().status.phase, "Control confirmation");
+    assert.match(await host.tool("status"), /enabled: true/);
+    assert.equal((await host.tool("enable")).resultType, "rejected");
+    assert.equal(host.confirmations.length, 1);
+    finish(true);
+    assert.match(await request, /disabled/);
+    assert.match(await host.tool("status"), /enabled: false/);
 });
 
 test("review remains deferred and visible; merely opening a panel never queues one", async (t) => {
