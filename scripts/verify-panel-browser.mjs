@@ -117,6 +117,19 @@ try {
         if (result.exceptionDetails) throw new Error(JSON.stringify(result.exceptionDetails));
         return result.result.value;
     };
+    const click = async (id) => {
+        const point = await evaluate(`(() => {
+            const element = document.getElementById(${JSON.stringify(id)});
+            element.scrollIntoView({ block: 'center' });
+            const box = element.getBoundingClientRect();
+            const x = box.left + box.width / 2, y = box.top + box.height / 2;
+            return { x, y, hit: element.contains(document.elementFromPoint(x, y)), disabled: element.disabled };
+        })()`);
+        assert.equal(point.hit, true, `Control is not hit-testable: ${id}`);
+        assert.equal(point.disabled, false, `Control is disabled: ${id}`);
+        await command("Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", clickCount: 1 });
+        await command("Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", clickCount: 1 });
+    };
     await command("Runtime.enable");
     await command("Page.enable");
     await command("Emulation.setDeviceMetricsOverride", { width: 520, height: 1000, deviceScaleFactor: 1, mobile: false });
@@ -137,7 +150,12 @@ try {
     assert.equal(await evaluate("document.getElementById('enabled').checked"), true);
     assert.equal(await evaluate("document.getElementById('model').value"), "example-model");
     assert.equal(settingsApplied, 0);
-    await evaluate("document.getElementById('enabled').click(); document.getElementById('model').value='next-model'; document.getElementById('model').dispatchEvent(new Event('input')); document.getElementById('apply-setting').click()");
+    await evaluate("document.getElementById('enabled').click(); document.getElementById('model').value=''; document.getElementById('model').dispatchEvent(new Event('input'))");
+    await click("apply-setting");
+    assert.match(await evaluate("document.getElementById('setting-result').textContent"), /Enter a model identifier/);
+    assert.equal(settingsApplied, 0);
+    await evaluate("document.getElementById('model').value='next-model'; document.getElementById('model').dispatchEvent(new Event('input'))");
+    await click("apply-setting");
     await eventually(() => settingsApplied === 1, "one-click setting change");
     await eventually(async () => (await evaluate("document.getElementById('setting-result').textContent")).startsWith("Setting applied"), "applied outcome");
     assert.equal(state.status.enabled, false);
@@ -147,7 +165,7 @@ try {
     await delay(100);
     assert.equal(await evaluate("document.getElementById('enabled').checked"), true);
     assert.equal(await evaluate("document.getElementById('model').value"), "next-model");
-    await evaluate("document.getElementById('apply-setting').click()");
+    await click("apply-setting");
     await eventually(async () => (await evaluate("document.getElementById('setting-result').textContent")).startsWith("Not applied:"), "stale setting rejection");
     assert.equal(settingsApplied, 1);
     await evaluate("document.getElementById('reset-setting').click()");
@@ -164,8 +182,8 @@ try {
             return response;
         };
         document.getElementById('enabled').click();
-        document.getElementById('apply-setting').click();
     }`);
+    await click("apply-setting");
     await eventually(async () => (await evaluate("document.getElementById('setting-result').textContent")).startsWith("Could not confirm"), "unknown submitted outcome");
     assert.equal(settingsApplied, 2);
     assert.equal(state.status.enabled, true);
@@ -175,7 +193,8 @@ try {
     await evaluate("document.getElementById('refresh').click()");
     await eventually(async () => await evaluate("document.getElementById('enabled').disabled") === false, "unknown outcome recovery");
     assert.equal(await evaluate("document.getElementById('enabled').checked"), true);
-    await evaluate("document.getElementById('model').value='recovered-model'; document.getElementById('model').dispatchEvent(new Event('input')); document.getElementById('apply-setting').click()");
+    await evaluate("document.getElementById('model').value='recovered-model'; document.getElementById('model').dispatchEvent(new Event('input'))");
+    await click("apply-setting");
     await eventually(() => settingsApplied === 3, "settings usable after outcome recovery");
     assert.equal(state.status.enabled, true);
     assert.equal(state.status.model, "recovered-model");
