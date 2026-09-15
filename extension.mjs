@@ -671,20 +671,21 @@ async function runScreener(session, prompt, { recognise = looksLikeVerdict, labe
     screenerWatch = watch;
 
     let agentId;
+    const model = cfg("screenerModel");
     try {
         ({ agentId } = await rpc.tasks.startAgent({
             agentType: cfg("agentType"),
             prompt,
             name: "self-learn",
             description: SCREENER_DESCRIPTION,
-            model: cfg("screenerModel"),
+            model,
         }));
     } catch (err) {
         screenerWatch = null;
         throw err;
     }
     watch.agentId = agentId;
-    debug(`${label} ${agentId} started on ${cfg("screenerModel")} (baseline ${baseline})`);
+    debug(`${label} ${agentId} started on ${model} (baseline ${baseline})`);
 
     const deadline = Date.now() + cfg("timeoutMs");
     let seen = false;
@@ -1572,14 +1573,19 @@ function activitySnapshot() {
 
 const activityPanel = createActivityPanel({
     getSnapshot: activitySnapshot,
-    applySettings: ({ enabled, expectedEnabled }) => {
+    applySettings: ({ expected, desired }) => {
         if (state.confirmingControl || state.resolvingProposal) {
             throw Object.assign(new Error("Another confirmation is open. Nothing changed; try again after it closes."), { statusCode: 409 });
         }
-        if (cfg("enabled") !== expectedEnabled) {
-            throw Object.assign(new Error("The setting changed while you were editing. Reset the form and review again."), { statusCode: 409 });
+        if (cfg("enabled") !== expected.enabled || cfg("screenerModel") !== expected.model) {
+            throw Object.assign(new Error("Settings changed while you were editing. Reset the form before applying again."), { statusCode: 409 });
         }
-        return setEnabled(enabled, "canvas");
+        if (cfg("screenerModel") !== desired.model) {
+            state.sessionOverrides.screenerModel = desired.model;
+            activity?.record("notice", `Self-learn model set to ${desired.model} (canvas)`);
+        }
+        if (cfg("enabled") !== desired.enabled) setEnabled(desired.enabled, "canvas");
+        return `Session settings applied: ${desired.enabled ? "enabled" : "disabled"}, model ${desired.model}.`;
     },
     onError: (error) => debug(`activity panel error: ${error.message}`),
 });

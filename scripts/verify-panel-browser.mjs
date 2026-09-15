@@ -31,12 +31,13 @@ const errors = [];
 let settingsApplied = 0;
 const panel = createActivityPanel({
     getSnapshot: () => state, onError: (error) => errors.push(error), intervalMs: 50,
-    applySettings({ enabled, expectedEnabled }) {
-        if (state.status.enabled !== expectedEnabled) {
+    applySettings({ expected, desired }) {
+        if (state.status.enabled !== expected.enabled || state.status.model !== expected.model) {
             throw Object.assign(new Error("Setting changed elsewhere"), { statusCode: 409 });
         }
         settingsApplied++;
-        state.status.enabled = enabled;
+        state.status.enabled = desired.enabled;
+        state.status.model = desired.model;
         return "Setting applied for this session";
     },
 });
@@ -128,26 +129,29 @@ try {
     await evaluate("document.getElementById('kind').value='review'; document.getElementById('kind').dispatchEvent(new Event('input'));");
     assert.equal(await evaluate("document.querySelectorAll('#entries li').length"), 1);
     await evaluate("document.getElementById('kind').value='all'; document.getElementById('kind').dispatchEvent(new Event('input'));");
-    await evaluate("document.getElementById('enabled').click(); document.getElementById('settings').requestSubmit();");
-    assert.equal(await evaluate("document.getElementById('setting-confirmation').hidden"), false);
+    assert.equal(await evaluate("document.getElementById('model').value"), "example-model");
+    assert.equal(await evaluate("document.getElementById('review-setting')"), null);
+    await evaluate("document.getElementById('enabled').click(); document.getElementById('model').value='next-model'; document.getElementById('model').dispatchEvent(new Event('input'));");
     assert.equal(settingsApplied, 0);
-    await evaluate("document.getElementById('cancel-setting').click()");
+    await evaluate("document.getElementById('reset-setting').click()");
     assert.equal(await evaluate("document.getElementById('enabled').checked"), true);
+    assert.equal(await evaluate("document.getElementById('model').value"), "example-model");
     assert.equal(settingsApplied, 0);
-    await evaluate("document.getElementById('enabled').click(); document.getElementById('settings').requestSubmit(); document.getElementById('apply-setting').click()");
-    await eventually(() => settingsApplied === 1, "confirmed setting change");
+    await evaluate("document.getElementById('enabled').click(); document.getElementById('model').value='next-model'; document.getElementById('model').dispatchEvent(new Event('input')); document.getElementById('apply-setting').click()");
+    await eventually(() => settingsApplied === 1, "one-click setting change");
     await eventually(async () => (await evaluate("document.getElementById('setting-result').textContent")).startsWith("Setting applied"), "applied outcome");
     assert.equal(state.status.enabled, false);
-    assert.equal(await evaluate("document.getElementById('setting-confirmation').hidden"), true);
-    await evaluate("document.getElementById('enabled').click(); document.getElementById('settings').requestSubmit()");
-    state.status.enabled = true;
+    assert.equal(state.status.model, "next-model");
+    await evaluate("document.getElementById('enabled').click()");
+    state.status.model = "outside-model";
     await delay(100);
     assert.equal(await evaluate("document.getElementById('enabled').checked"), true);
+    assert.equal(await evaluate("document.getElementById('model').value"), "next-model");
     await evaluate("document.getElementById('apply-setting').click()");
     await eventually(async () => (await evaluate("document.getElementById('setting-result').textContent")).startsWith("Not applied:"), "stale setting rejection");
     assert.equal(settingsApplied, 1);
     await evaluate("document.getElementById('reset-setting').click()");
-    assert.equal(await evaluate("document.getElementById('setting-confirmation').hidden"), true);
+    assert.equal(await evaluate("document.getElementById('model').value"), "outside-model");
     await evaluate(`{
         const original = window.fetch;
         window.fetch = async (...args) => {
@@ -160,21 +164,21 @@ try {
             return response;
         };
         document.getElementById('enabled').click();
-        document.getElementById('settings').requestSubmit();
         document.getElementById('apply-setting').click();
     }`);
     await eventually(async () => (await evaluate("document.getElementById('setting-result').textContent")).startsWith("Could not confirm"), "unknown submitted outcome");
     assert.equal(settingsApplied, 2);
-    assert.equal(state.status.enabled, false);
-    await evaluate("document.getElementById('cancel-setting').click()");
+    assert.equal(state.status.enabled, true);
+    await evaluate("document.getElementById('reset-setting').click()");
     assert.match(await evaluate("document.getElementById('setting-result').textContent"), /Could not confirm/);
     assert.equal(await evaluate("document.getElementById('enabled').disabled"), true);
     await evaluate("document.getElementById('refresh').click()");
     await eventually(async () => await evaluate("document.getElementById('enabled').disabled") === false, "unknown outcome recovery");
-    assert.equal(await evaluate("document.getElementById('enabled').checked"), false);
-    await evaluate("document.getElementById('enabled').click(); document.getElementById('settings').requestSubmit(); document.getElementById('apply-setting').click()");
+    assert.equal(await evaluate("document.getElementById('enabled').checked"), true);
+    await evaluate("document.getElementById('model').value='recovered-model'; document.getElementById('model').dispatchEvent(new Event('input')); document.getElementById('apply-setting').click()");
     await eventually(() => settingsApplied === 3, "settings usable after outcome recovery");
     assert.equal(state.status.enabled, true);
+    assert.equal(state.status.model, "recovered-model");
     state.status.phase = "Idle";
     state.entries.push({ id: "4", at: "2026-01-01T10:04:00Z", kind: "notice", message: "A new entry arrived over the live connection." });
     await eventually(async () => await evaluate("document.getElementById('phase').textContent") === "Idle", "live state update");
@@ -203,7 +207,7 @@ try {
     await command("Page.navigate", { url: reopened.url });
     await eventually(async () => await evaluate("document.querySelectorAll('#entries li').length") === 4, "reopen with retained state");
     assert.deepEqual(errors, []);
-    console.log("Browser checks passed: render, live update, filtering, literal text, inline settings confirmation/cancel/apply/stale rejection, refresh, 320px layout, disconnect and reopen.");
+    console.log("Browser checks passed: render, live update, filtering, literal text, one-click enabled/model Apply, reset, stale rejection, response-loss recovery, 320px layout, disconnect and reopen.");
     if (screenshotDir) console.log(`Screenshots: ${screenshotDir}`);
 } finally {
     if (socket?.readyState === WebSocket.OPEN) {

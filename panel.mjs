@@ -26,10 +26,16 @@ function readSettings(request) {
             if (size > 2048) return;
             try {
                 const value = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-                if (!value || Array.isArray(value) ||
-                    Object.keys(value).length !== 2 ||
-                    typeof value.enabled !== "boolean" || typeof value.expectedEnabled !== "boolean") {
-                    throw new Error("Expected only enabled and expectedEnabled boolean values");
+                const settings = (item) => item && !Array.isArray(item) &&
+                    Object.keys(item).length === 2 &&
+                    typeof item.enabled === "boolean" && typeof item.model === "string";
+                if (!value || Array.isArray(value) || Object.keys(value).length !== 2 ||
+                    !settings(value.expected) || !settings(value.desired)) {
+                    throw new Error("Expected enabled/model values under expected and desired");
+                }
+                if (!value.desired.model || value.desired.model.length > 200 ||
+                    /[\s\u0000-\u001f\u007f]/.test(value.desired.model)) {
+                    throw new Error("Model must be a nonempty identifier of at most 200 characters, without whitespace or control characters");
                 }
                 resolve(value);
             } catch (error) {
@@ -204,7 +210,7 @@ export function createActivityPanel({ getSnapshot, applySettings, onError, inter
         declaration: {
             id: "self-learn-activity",
             displayName: "Self-learn activity",
-            description: "Live self-learn activity, pending-proposal summary and confirmed session enable/disable settings.",
+            description: "Live self-learn activity, pending-proposal summary and per-session enabled/model settings.",
             inputSchema: { type: "object", properties: {}, additionalProperties: false },
             actions: [{
                 name: "refresh",

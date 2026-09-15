@@ -32,19 +32,15 @@
       <h2 id="settings-title">Session settings</h2>
       <form id="settings">
         <label class="toggle"><input id="enabled" type="checkbox" disabled> Enable self-learn</label>
-        <p class="muted">Changes affect this session only, not your config file. Disabling does not cancel a running review or clear a pending proposal.</p>
+        <label class="model-setting">Model (screening and drafting)
+          <input id="model" type="text" required maxlength="200" autocomplete="off" spellcheck="false" disabled>
+        </label>
+        <p class="muted">Changes affect this session only, not your config file. They do not cancel running work or clear a pending proposal. Model changes apply to later model requests.</p>
         <div class="settings-buttons">
-          <button id="review-setting" type="submit" disabled>Review change</button>
+          <button id="apply-setting" type="submit" disabled>Apply</button>
           <button id="reset-setting" type="button" hidden>Reset</button>
         </div>
       </form>
-      <div id="setting-confirmation" class="confirmation" hidden>
-        <p id="setting-summary"></p>
-        <div class="settings-buttons">
-          <button id="apply-setting" type="button">Apply change</button>
-          <button id="cancel-setting" type="button">Cancel</button>
-        </div>
-      </div>
       <p id="setting-result" role="status" aria-live="polite"></p>
     </section>
     <section aria-labelledby="activity-title">
@@ -65,7 +61,7 @@
       <ol id="entries" aria-label="Activity, newest first"></ol>
     </section>
     <footer>
-      <p>Settings require confirmation here. Ask the agent to request a review; skill writes still require the existing approval dialog.</p>
+      <p>Apply changes these session settings directly. Agent-tool changes and skill writes still require their existing approval dialogs.</p>
       <p id="session" class="muted"></p>
     </footer>
   </main>

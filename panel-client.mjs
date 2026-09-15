@@ -48,27 +48,29 @@ export function renderSnapshot(document, snapshot) {
 if (typeof document !== "undefined") {
     let snapshot;
     let dirty = false;
-    let expectedEnabled;
-    let candidate = null;
+    let expected;
     let applying = false;
     let outcomeUnknown = false;
     const connection = document.getElementById("connection");
     const error = document.getElementById("error");
     const enabled = document.getElementById("enabled");
-    const review = document.getElementById("review-setting");
+    const model = document.getElementById("model");
+    const apply = document.getElementById("apply-setting");
     const reset = document.getElementById("reset-setting");
-    const confirmation = document.getElementById("setting-confirmation");
     const resultText = document.getElementById("setting-result");
+    const lockForm = () => {
+        const locked = !snapshot || applying || outcomeUnknown;
+        for (const element of [enabled, model, apply, reset]) element.disabled = locked;
+    };
     const resetForm = () => {
         dirty = false;
-        candidate = null;
-        confirmation.hidden = true;
         reset.hidden = true;
-        document.getElementById("apply-setting").disabled = applying || outcomeUnknown;
         if (snapshot) {
-            expectedEnabled = snapshot.status.enabled;
-            enabled.checked = expectedEnabled;
+            expected = { enabled: snapshot.status.enabled, model: snapshot.status.model };
+            enabled.checked = expected.enabled;
+            model.value = expected.model;
         }
+        lockForm();
     };
     const display = (result) => {
         if (result.error) throw new Error(result.error);
@@ -76,8 +78,7 @@ if (typeof document !== "undefined") {
         renderSnapshot(document, snapshot);
         error.hidden = true;
         if (!dirty && !applying) resetForm();
-        enabled.disabled = applying || outcomeUnknown;
-        review.disabled = applying || outcomeUnknown;
+        lockForm();
     };
     const failed = (message) => {
         error.textContent = message;
@@ -93,8 +94,7 @@ if (typeof document !== "undefined") {
             if (recoverUnknown && outcomeUnknown && result.snapshot && !result.error) {
                 outcomeUnknown = false;
                 dirty = false;
-                resetForm();
-                resultText.textContent = "Current setting refreshed. Review a new change if needed.";
+                resultText.textContent = "Current settings refreshed. You can apply a new change.";
             }
             display(result);
         } catch (failure) {
@@ -104,50 +104,38 @@ if (typeof document !== "undefined") {
         }
     }
     document.getElementById("refresh").addEventListener("click", () => refresh(true));
-    enabled.addEventListener("change", () => {
-        dirty = true;
-        candidate = null;
-        confirmation.hidden = true;
-        reset.hidden = false;
-        resultText.textContent = "";
+    for (const element of [enabled, model]) {
+        element.addEventListener("input", () => {
+            dirty = true;
+            reset.hidden = false;
+            resultText.textContent = "";
+        });
+    }
+    reset.addEventListener("click", () => {
+        if (applying || outcomeUnknown) return;
+        resetForm();
+        resultText.textContent = "Edits reset. No new change applied.";
     });
-    document.getElementById("settings").addEventListener("submit", (event) => {
+    document.getElementById("settings").addEventListener("submit", async (event) => {
         event.preventDefault();
         if (!snapshot || applying || outcomeUnknown) return;
-        if (enabled.checked === snapshot.status.enabled) {
+        const desired = { enabled: enabled.checked, model: model.value.trim() };
+        if (!desired.model || desired.model.length > 200 || /[\s\u0000-\u001f\u007f]/.test(desired.model)) {
+            resultText.textContent = "Enter a model identifier without whitespace or control characters (at most 200 characters).";
+            return;
+        }
+        if (desired.enabled === snapshot.status.enabled && desired.model === snapshot.status.model) {
             resetForm();
-            resultText.textContent = "This setting already has that value. Nothing changed.";
+            resultText.textContent = "These settings already have those values. Nothing changed.";
             return;
         }
-        candidate = { enabled: enabled.checked, expectedEnabled };
-        document.getElementById("setting-summary").textContent =
-            `${candidate.enabled ? "Enable" : "Disable"} self-learn for this session? No config file, running review or pending proposal will be changed.`;
-        confirmation.hidden = false;
-    });
-    const cancel = () => {
-        if (applying) return;
-        if (outcomeUnknown) {
-            candidate = null;
-            confirmation.hidden = true;
-            reset.hidden = true;
-            return;
-        }
-        resetForm();
-        resultText.textContent = "Edit cancelled. No new change applied.";
-    };
-    reset.addEventListener("click", cancel);
-    document.getElementById("cancel-setting").addEventListener("click", cancel);
-    document.getElementById("apply-setting").addEventListener("click", async () => {
-        if (!candidate || applying || outcomeUnknown) return;
         applying = true;
-        enabled.disabled = true;
-        review.disabled = true;
-        document.getElementById("apply-setting").disabled = true;
-        document.getElementById("cancel-setting").disabled = true;
+        lockForm();
+        resultText.textContent = "Applying...";
         try {
             const response = await fetch("./settings", {
                 method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(candidate),
+                body: JSON.stringify({ expected, desired }),
             });
             const result = await response.json();
             if (!response.ok || result.applied !== true) {
@@ -157,13 +145,11 @@ if (typeof document !== "undefined") {
                 }
                 throw new Error(result.error || `Settings request failed (${response.status})`);
             }
-            const desired = candidate.enabled;
             dirty = false;
-            candidate = null;
-            confirmation.hidden = true;
             reset.hidden = true;
-            expectedEnabled = desired;
-            enabled.checked = desired;
+            expected = desired;
+            enabled.checked = desired.enabled;
+            model.value = desired.model;
             if (result.snapshot && !result.error) display(result);
             resultText.textContent = result.message + (result.error ? ` Status could not refresh: ${result.error}` : "");
         } catch (failure) {
@@ -171,10 +157,7 @@ if (typeof document !== "undefined") {
             resultText.textContent = `Could not confirm the outcome: ${failure.message}. Refresh before trying again.`;
         } finally {
             applying = false;
-            enabled.disabled = outcomeUnknown;
-            review.disabled = outcomeUnknown;
-            document.getElementById("apply-setting").disabled = outcomeUnknown;
-            document.getElementById("cancel-setting").disabled = false;
+            lockForm();
         }
     });
     for (const id of ["kind", "search"]) {

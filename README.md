@@ -446,13 +446,17 @@ The feed does not store the transcript or full draft bodies. Each instance serve
 session's snapshot from a random capability URL on loopback, without CORS, with host/origin
 checks and literal-text rendering. Closing it stops its server, streams and timer.
 
-The **Session settings** section can enable or disable self-learn for the running session. Editing
-the checkbox changes nothing until **Review change**, then **Apply change**; Cancel discards the
-edit. Confirmation stays inside the panel and starts no agent turn or idle-host dialog. The
-bounded JSON POST requires the panel's own origin and capability URL, validates the exact fields,
-and rejects a stale expected value or an already-open confirmation before changing state. A failed
+The **Session settings** section can enable or disable self-learn and change its screening/drafting
+model for the running session. Edit the fields, then click **Apply** once; Reset discards unsent
+edits. There is no extra Review step, agent turn or idle-host dialog. The model field takes an
+identifier; model availability is still determined by the normal model-request path. A change
+affects later requests, not an already-running screening or draft.
+
+The bounded JSON POST requires the panel's own origin and capability URL, validates all desired
+fields before mutation, and rejects stale expected settings or an already-open tool/skill
+confirmation before changing state. A failed
 or disconnected response is not presented as proof that nothing happened: the panel reports an
-unknown outcome and disables resubmission until an explicit refresh succeeds. Cancel or Reset
+unknown outcome and disables resubmission until an explicit refresh succeeds. Reset
 does not erase that warning or pretend to undo a submitted request. No global config file is edited.
 
 The panel cannot start a review, discard proposals or write skills. Use `self_learn_now` for those

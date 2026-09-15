@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { boot } from "./test-support/host.mjs";
 
 test("the shipped extension registers its read-only activity action and shared status", async (t) => {
@@ -115,7 +116,10 @@ test("canvas settings share the session helper but never open an agent dialog or
     const { url } = await canvas.open({ instanceId: "settings" });
     const post = (enabled, expectedEnabled) => fetch(url + "settings", {
         method: "POST", headers: { Origin: new URL(url).origin, "Content-Type": "application/json" },
-        body: JSON.stringify({ enabled, expectedEnabled }),
+        body: JSON.stringify({
+            expected: { enabled: expectedEnabled, model: canvas.actions[0].handler().status.model },
+            desired: { enabled, model: canvas.actions[0].handler().status.model },
+        }),
     });
     const result = await post(false, true);
     assert.equal(result.status, 200);
@@ -137,4 +141,30 @@ test("canvas settings share the session helper but never open an agent dialog or
     assert.equal(canvas.actions[0].handler().status.enabled, true);
     finish(false);
     assert.equal((await pending).resultType, "rejected");
+});
+
+test("canvas model changes are session-local and validated atomically with enabled", async (t) => {
+    const host = await boot(t);
+    const canvas = host.options.canvases[0];
+    const before = canvas.actions[0].handler().status;
+    const configFile = join(host.root, "config.json");
+    const config = readFileSync(configFile, "utf8");
+    host.openInstances = ["model"];
+    const { url } = await canvas.open({ instanceId: "model" });
+    const post = (model) => fetch(url + "settings", {
+        method: "POST", headers: { Origin: new URL(url).origin, "Content-Type": "application/json" },
+        body: JSON.stringify({
+            expected: { enabled: before.enabled, model: before.model },
+            desired: { enabled: false, model },
+        }),
+    });
+    assert.equal((await post("bad model")).status, 400);
+    assert.equal(canvas.actions[0].handler().status.enabled, true);
+    assert.equal(canvas.actions[0].handler().status.model, before.model);
+    assert.equal((await post("fixture-model")).status, 200);
+    assert.equal(canvas.actions[0].handler().status.enabled, false);
+    assert.equal(canvas.actions[0].handler().status.model, "fixture-model");
+    assert.equal(readFileSync(configFile, "utf8"), config);
+    assert.equal(host.confirmations.length, 0);
+    assert.equal(canvas.actions[0].handler().status.reviewQueued, false);
 });

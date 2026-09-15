@@ -25,11 +25,12 @@ async function fixture(t) {
     const panel = createActivityPanel({
         getSnapshot: () => state, onError: (error) => errors.push(error), intervalMs: 20,
         applySettings(change) {
-            if (change.expectedEnabled !== state.status.enabled) {
+            if (change.expected.enabled !== state.status.enabled || change.expected.model !== state.status.model) {
                 throw Object.assign(new Error("Setting changed elsewhere"), { statusCode: 409 });
             }
             changes.push(change);
-            state.status.enabled = change.enabled;
+            state.status.enabled = change.desired.enabled;
+            state.status.model = change.desired.model;
             return "Setting applied";
         },
     });
@@ -89,15 +90,19 @@ test("HTTP reads are capability-scoped and reject foreign origins/hosts", async 
 test("settings writes validate origin, content, byte budget and expected baseline", async (t) => {
     const { url, changes, state } = await fixture(t);
     const origin = new URL(url).origin;
-    const body = JSON.stringify({ enabled: false, expectedEnabled: true });
+    const base = { enabled: true, model: "fixture" };
+    const body = JSON.stringify({ expected: base, desired: { enabled: false, model: "next-fixture" } });
     const send = (text, headers = {}) => fetch(url + "settings", {
         method: "POST", headers: { Origin: origin, "Content-Type": "application/json", ...headers }, body: text,
     });
     assert.equal((await fetch(url + "settings", { method: "POST", headers: { "Content-Type": "application/json" }, body })).status, 403);
     assert.equal((await send(body, { Origin: "https://unrelated.example" })).status, 403);
     assert.equal((await send(body, { "Content-Type": "text/plain" })).status, 415);
-    for (const invalid of ['{}', 'null', '[]', '{"enabled":"false","expectedEnabled":true}',
-        '{"enabled":false,"expectedEnabled":true,"file":"elsewhere"}', 'not json']) {
+    for (const invalid of ['{}', 'null', '[]', '{"enabled":"false","expectedEnabled":true}', 'not json',
+        JSON.stringify({ expected: base, desired: { enabled: false, model: "fixture", file: "elsewhere" } }),
+        ...["", "bad model", "x".repeat(201), "fixture\n"].map((model) => JSON.stringify({
+            expected: base, desired: { enabled: false, model },
+        }))]) {
         assert.equal((await send(invalid)).status, 400);
     }
     assert.equal((await send("x".repeat(4096))).status, 413);
@@ -106,6 +111,7 @@ test("settings writes validate origin, content, byte budget and expected baselin
     assert.equal(applied.status, 200);
     assert.equal((await applied.json()).applied, true);
     assert.equal(state.status.enabled, false);
+    assert.equal(state.status.model, "next-fixture");
     assert.equal(changes.length, 1);
     const stale = await send(body);
     assert.equal(stale.status, 409);
@@ -123,7 +129,10 @@ test("a failed read after applying a setting is not reported as an unapplied cha
     const { url } = await panel.declaration.open({ instanceId: "outcome" });
     const response = await fetch(url + "settings", {
         method: "POST", headers: { Origin: new URL(url).origin, "Content-Type": "application/json" },
-        body: JSON.stringify({ enabled: false, expectedEnabled: true }),
+        body: JSON.stringify({
+            expected: { enabled: true, model: "fixture" },
+            desired: { enabled: false, model: "fixture" },
+        }),
     });
     const result = await response.json();
     assert.equal(result.applied, true);
