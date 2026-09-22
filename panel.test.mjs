@@ -223,12 +223,15 @@ test("renderer filters without mutating history or interpreting markup", () => {
     const state = snapshot();
     state.entries = [
         { id: "1", at: "2026-01-01T00:00:00Z", kind: "review", message: "Routine review" },
-        { id: "2", at: "2026-01-01T00:01:00Z", kind: "error", message: "<img src=x onerror=alert(1)>" },
+        { id: "2", at: "2026-01-02T00:00:00Z", kind: "error", message: "<img src=x onerror=alert(1)>" },
     ];
     state.storageError = "History read failed";
     state.status.pending = { mode: "extend", name: "fixture", deferred: true };
     renderSnapshot(document, state);
     assert.equal(document.getElementById("entries").children[0].children[1].textContent, state.entries[1].message);
+    const timestamps = document.getElementById("entries").children.map((item) => item.children[0].textContent.split(" | ")[1]);
+    assert.deepEqual(timestamps, state.entries.slice().reverse().map((entry) => new Date(entry.at).toLocaleString()));
+    assert.notEqual(timestamps[0], timestamps[1], "Same clock time on different days must remain distinguishable");
     assert.match(document.getElementById("pending").textContent, /held until next turn/);
     assert.equal(document.getElementById("storage-error").hidden, false);
     assert.equal(state.entries[0].id, "1");
