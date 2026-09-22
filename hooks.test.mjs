@@ -4,6 +4,16 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { boot } from "./test-support/host.mjs";
 
+test("review and status are preloaded without changing scheduling or other tools", async (t) => {
+    const host = await boot(t);
+    const review = host.options.tools.find((tool) => tool.name === "self_learn_now");
+    assert.equal(review.defer, "never");
+    assert.equal(host.options.tools.find((tool) => tool.name === "propose_skill").defer, undefined);
+    assert.match(await review.handler({ action: "status" }, {}), /queued review: no/);
+    assert.match(await review.handler({ action: "review" }, {}), /Review queued/);
+    assert.equal(host.options.canvases[0].actions[0].handler().status.reviewQueued, true);
+});
+
 test("the shipped extension registers its read-only activity action and shared status", async (t) => {
     const host = await boot(t);
     const canvas = host.options.canvases[0];

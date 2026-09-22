@@ -1595,6 +1595,9 @@ const session = await joinSession({
     tools: [
         {
             name: "self_learn_now",
+            // Keep review/status directly callable even when a resumed host has already
+            // cached its deferred schema but no longer exposes that schema to the agent.
+            defer: "never",
             description:
                 "Run a self-learn review: check whether recent work produced a durable, reusable " +
                 "lesson worth saving as a skill, and if so draft it for the user to approve.\n" +

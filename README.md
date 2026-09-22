@@ -399,6 +399,17 @@ Extension command completion is a CLI TUI capability. App support is tracked in
 [github/app#3056](https://github.com/github/app/issues/3056); use the agent tool when the app does not
 expose these commands, rather than assuming that a registered command appears in its composer.
 
+The review/status tool requests SDK `defer: "never"` so that it remains in the agent's initial
+tool set without a discovery round trip. Other tools retain their normal loading policy.
+This changes availability only, not review scheduling, sub-agent guards or approval requirements.
+
+When diagnosing tools, distinguish registration from schema discovery and actual invocation.
+A repeated `api_tool.list_resources` request can return **zero new schemas even while the
+previously loaded tool remains callable**. Do not treat that response alone as a missing tool or
+recommend a reload on that basis. Try the loaded `self_learn_now` with `action: "status"` first;
+it does not start a review. If a host does not honor preloading, record that separately rather
+than assuming successful extension startup proves the tool was exposed.
+
 | Tool | Purpose |
 | --- | --- |
 | `self_learn_now` (`action: "review"`) | Queue a screening for the end of the turn; escalate on a hit. |
