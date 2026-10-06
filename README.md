@@ -317,6 +317,52 @@ This proves the renderer, not the app's canvas integration. In an app session th
 checkout, use `list_canvas_capabilities`, `open_canvas`, and the `refresh` action, and verify the
 panel itself. Neither a successful RPC nor a recorded `session.info` event alone proves visibility.
 
+### Isolated SDK capability prototype
+
+`scripts/sdk-capability-probe.mjs` is opt-in research, not an extension runtime dependency.
+Its local checks do not call a model:
+
+```powershell
+node scripts\sdk-capability-probe.mjs --self-test
+node scripts\sdk-capability-probe.mjs --verify-report "C:\scratch\sdk-probe\run-example\report.json"
+```
+
+For a live experiment, create a private `package.json` in a separate scratch directory, pinning
+`@github/copilot-sdk` to `1.0.17-preview.4` and `@github/copilot` to `1.0.92-4`. Install there with
+`npm install --ignore-scripts --no-audit --no-fund`, not in this repository or the app's SDK.
+Then run `node scripts\sdk-capability-probe.mjs --live --scratch "C:\scratch\sdk-probe"`.
+This explicitly spends model calls using the existing `gh` login. `--profile installed` or
+`--profile preview` selects one stack; `--installed-sdk`, `--installed-cli`, and `--model` make
+the inputs explicit. The live runner is Windows-specific and records actual versions and hashes.
+The `installed` profile defaults to the historical CLI fixture `1.0.90-0`, not automatic runtime
+discovery; use `--installed-cli` when evaluating another app-bundled runtime.
+
+Each profile uses its own `COPILOT_HOME`, empty working directory and deny-by-default permissions,
+without real extensions or user configuration discovery. Model cases are bounded, and only
+deterministic marker tools plus one fixture child are offered. Reports stay under the chosen
+scratch directory and must not be committed: they contain local diagnostic paths and identifiers.
+
+The October 6, 2026 experiment established:
+
+| Capability | App-bundled SDK / CLI 1.0.90-0 | SDK 1.0.17-preview.4 / CLI 1.0.92-4 |
+| --- | --- | --- |
+| Typed structured result and request correlation | Passed | Passed |
+| Owner-scoped `setTools`, preserving another client's tool | Not exposed | Passed |
+| Subagent start context, stop response/identity, response rewrite | Not exposed | Passed |
+
+The preview still called the general `onAgentStop` for the child, with the child's
+`input.sessionId` but the parent's `invocation.sessionId`. Keep the existing main-agent guard.
+The lifecycle-specific stop hook instead supplies its child identity in `input.agentId`.
+The first probe assertion incorrectly expected a root-only general stop; replaying the retained
+events with the corrected assertion and negative fixtures verified the measured behavior without
+additional model calls.
+
+These are standalone SDK measurements, **not** app-canvas/notification results or a migration of
+production `tasks.startAgent`. That task API does not acquire schema or reasoning-effort fields
+from this experiment. Approval, evidence validation and reviewer policy remain unchanged.
+Background-RPC hook delivery, multi-child races, in-flight tool replacement and attributed
+immediate steering need separate evidence before adoption.
+
 ### What the tests are worth, measured
 
 A green suite is not evidence that the tests would catch anything. The only way to find out is to
