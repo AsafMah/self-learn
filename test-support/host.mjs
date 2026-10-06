@@ -1,5 +1,5 @@
 import { registerHooks } from "node:module";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -13,12 +13,17 @@ registerHooks({
     },
 });
 
-export async function boot(t) {
+export async function boot(t, { pendingProposal } = {}) {
     const root = mkdtempSync(join(tmpdir(), "self-learn-host-"));
     const oldConfig = process.env.COPILOT_SELF_LEARN_CONFIG;
     const configPath = join(root, "config.json");
     writeFileSync(configPath, JSON.stringify({ autoScreen: false, debugLog: join(root, "debug.log") }));
     process.env.COPILOT_SELF_LEARN_CONFIG = configPath;
+    if (pendingProposal) {
+        mkdirSync(join(root, "files"));
+        writeFileSync(join(root, "files", "self-learn-pending.json"),
+            JSON.stringify({ savedAt: Date.now(), proposal: pendingProposal }));
+    }
     const listeners = [];
     const logs = [];
     const host = {
@@ -44,6 +49,17 @@ export async function boot(t) {
             },
         },
         emit(event) { for (const listener of listeners) listener(event); },
+        async submitPrompt(content, { agentId, source, transformedContent = content } = {}) {
+            // Current hosts do not identify child prompts on the opening hook bracket.
+            const hookInvocationId = randomUUID();
+            host.emit({ type: "hook.start", data: {
+                hookInvocationId, hookType: "userPromptSubmitted", input: { prompt: content },
+            } });
+            await host.options.hooks.onUserPromptSubmitted?.({ prompt: content }, { sessionId: host.session.sessionId });
+            host.emit({ type: "hook.end", data: { hookInvocationId } });
+            host.emit({ type: "user.message", ...(agentId ? { agentId } : {}),
+                data: { content, transformedContent, ...(source ? { source } : {}) } });
+        },
         tool(action, invocation = {}) {
             return host.options.tools.find((tool) => tool.name === "self_learn_now").handler({ action }, invocation);
         },

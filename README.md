@@ -534,14 +534,16 @@ this extension's *own* screener prompt, since the screener is started as an agen
 next spoke was released early. Measured over one real session: 20 `userPromptSubmitted` dispatches,
 only 5 of them actually the user.
 
-Hook payloads carry no agent identity, but hook dispatches are still attributable. The event log
-brackets each one in `hook.start` / `hook.end` events that **do** carry `agentId`, correlated by
-`hookInvocationId`, and `hook.start` reaches the extension before the handler runs (verified with a
-throwaway probe: `hook.start` arrived 1.1 s ahead, and the dispatch resolved to SUBAGENT). Since the
-main agent and a sub-agent can be inside the same hook type concurrently, the open brackets are
-matched on the prompt itself rather than on hook type alone. Attribution deliberately **fails open**
-— an unattributable dispatch is treated as the user's, which preserves behaviour instead of silently
-disabling the extension.
+Prompt capture uses `user.message`, whose root events omit `agentId` and whose child events carry
+it. It no longer mutates state from `onUserPromptSubmitted`: observed child-opening hook brackets
+can omit both agent identity and parent tool identity, so matching an anonymous bracket by prompt
+text cannot establish ownership. Waiting a fixed interval does not repair missing identity.
+
+A child prompt must not change the captured main goal, reset main-tool counters, or release a held
+proposal. The registered-extension regressions cover bare UUID, `bg-` and task-style child IDs,
+identical main/child prompt text, and held-proposal persistence. Main-session messages forwarded
+from another agent remain context as before: `source` is not a replacement for `agentId` when
+classifying which agent receives a message, nor is a root message necessarily human-authored.
 
 `session.idle` and `session.task_complete` were checked for the same exposure and do not have it:
 across a full session, no event of either type ever carried an `agentId`. See below for the wider

@@ -104,6 +104,65 @@ test("review remains deferred and visible; merely opening a panel never queues o
     assert.equal(await host.tool("discard"), "No pending proposal.");
 });
 
+test("child opening prompts with anonymous hook brackets do not reset main-agent activity", async (t) => {
+    const host = await boot(t);
+    const status = () => host.options.canvases[0].actions[0].handler().status;
+    await host.submitPrompt("Investigate the real request");
+    host.emit({ type: "tool.execution_start", data: { toolName: "view", toolCallId: "main-read" } });
+    for (const agentId of ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "bg-fixture", "toolu_fixture"]) {
+        await host.submitPrompt("Only inspect this one file", { agentId, source: `agent-${host.session.sessionId}` });
+        assert.equal(status().toolCallsThisTurn, 1);
+    }
+    await host.submitPrompt("Continue with the next user request");
+    assert.equal(status().toolCallsThisTurn, 0);
+});
+
+test("only a main prompt releases a held proposal, not the screener's prompt", async (t) => {
+    const pendingProposal = {
+        mode: "new", name: "test-lesson", description: "A fixture lesson description",
+        body: "A fixture body with enough detail for the proposal validator.", why: "Fixture evidence",
+        deferred: true,
+    };
+    const host = await boot(t, { pendingProposal });
+    const pending = () => host.options.canvases[0].actions[0].handler().status.pending;
+    assert.equal(pending().deferred, true);
+    const sameText = "Check the fixture";
+    await host.submitPrompt(sameText, { agentId: "reviewer-fixture", source: `agent-${host.session.sessionId}` });
+    assert.equal(pending().deferred, true);
+    await host.submitPrompt(sameText);
+    assert.equal(pending().deferred, false);
+    const saved = JSON.parse(readFileSync(join(host.root, "files", "self-learn-pending.json"), "utf8"));
+    assert.equal(saved.proposal.deferred, false);
+    assert.equal(host.confirmations.length, 0);
+});
+
+test("main cross-session prompts remain context and malformed prompt events do not reset counters", async (t) => {
+    const host = await boot(t);
+    const status = () => host.options.canvases[0].actions[0].handler().status;
+    host.emit({ type: "tool.execution_start", data: { toolName: "view" } });
+    host.emit({ type: "user.message", data: {} });
+    host.emit({ type: "user.message", data: { content: null } });
+    assert.equal(status().toolCallsThisTurn, 1);
+    await host.submitPrompt("Operator follow-up", { source: "agent-other-session" });
+    assert.equal(status().toolCallsThisTurn, 0);
+});
+
+test("a child prompt cannot replenish the main agent's rejected-proposal budget", async (t) => {
+    const host = await boot(t);
+    const propose = host.options.tools.find((tool) => tool.name === "propose_skill");
+    const invalid = { mode: "new", name: "../escape", description: "Fixture", body: "Fixture body" };
+    await host.submitPrompt("Actual task");
+    for (let i = 0; i < 2; i++) {
+        const result = await propose.handler(invalid, {});
+        assert.equal(result.resultType, "failure");
+        assert.doesNotMatch(result.textResultForLlm, /No attempts left/);
+    }
+    await host.submitPrompt("Child task", { agentId: "child-fixture" });
+    assert.match((await propose.handler(invalid, {})).textResultForLlm, /No attempts left/);
+    await host.submitPrompt("Next main-agent turn");
+    assert.doesNotMatch((await propose.handler(invalid, {})).textResultForLlm, /No attempts left/);
+});
+
 test("own canvas queries do not count as work worth auto-screening", async (t) => {
     const host = await boot(t);
     const canvas = host.options.canvases[0];
