@@ -283,8 +283,10 @@ ln -s ~/src/self-learn ~/.copilot/extensions/self-learn
 
 Then `/extensions reload`.
 
-The whole directory has to be linked, not just `extension.mjs`: it imports `./lib.mjs`, which holds
-the pure core.
+Link or install the whole directory, not just `extension.mjs`: its runtime includes `lib.mjs`,
+`activity.mjs`, `panel.mjs`, and the `panel.html`, `panel.css`, and `panel-client.mjs` assets.
+Installing files does not replace the code already loaded by a running extension process. Start a
+new session to load the installation, or reload explicitly when no background review is in flight.
 
 ### Tests
 
@@ -295,12 +297,71 @@ npm test
 `node --test`, built into Node — the repo has no dependencies, which matters here because
 `node_modules` would otherwise appear inside a directory the CLI loads as an extension.
 
-`extension.mjs` ends with a top-level `await joinSession(...)`, so importing it from a test would
-try to connect to the host. Everything worth testing is therefore in `lib.mjs`, which touches no
-session, config, or disk: byte budgets are passed in rather than read from config. The tests cover
-what has real invariants — that the rubric cannot be talked past, that a quote is checked against
-the transcript, that writes cannot escape the skill directory, that frontmatter cannot be broken out
-of, and that repeated extends keep the previous file as an exact byte prefix.
+Core tests cover rubric validation, verbatim quotes, write containment, frontmatter, and append-only
+growth. Activity tests exercise bounded persistence, corrupt-history recovery, real HTTP/SSE
+delivery, isolation and cleanup. `hooks.test.mjs` boots the actual extension with only the SDK
+specifier redirected to an isolated test host; it needs Node 22.15+ for `module.registerHooks`.
+No live session or personal config is used.
+
+For a real browser check, run `npm run test:browser` with an installed Chromium-based browser.
+Windows defaults to the standard Microsoft Edge path; set `BROWSER_EXECUTABLE` for another
+installation. The runner uses a disposable headless profile, checks live updates, filtering,
+untrusted-text rendering, narrow layout, disconnect and reopen, then closes its own browser.
+An optional output directory saves light and narrow/dark screenshots:
+
+```powershell
+npm run test:browser -- "$env:TEMP\self-learn-panel-preview"
+```
+
+This proves the renderer, not the app's canvas integration. In an app session that has loaded this
+checkout, use `list_canvas_capabilities`, `open_canvas`, and the `refresh` action, and verify the
+panel itself. Neither a successful RPC nor a recorded `session.info` event alone proves visibility.
+
+### Isolated SDK capability prototype
+
+`scripts/sdk-capability-probe.mjs` is opt-in research, not an extension runtime dependency.
+Its local checks do not call a model:
+
+```powershell
+node scripts\sdk-capability-probe.mjs --self-test
+node scripts\sdk-capability-probe.mjs --verify-report "C:\scratch\sdk-probe\run-example\report.json"
+```
+
+For a live experiment, create a private `package.json` in a separate scratch directory, pinning
+`@github/copilot-sdk` to `1.0.17-preview.4` and `@github/copilot` to `1.0.92-4`. Install there with
+`npm install --ignore-scripts --no-audit --no-fund`, not in this repository or the app's SDK.
+Then run `node scripts\sdk-capability-probe.mjs --live --scratch "C:\scratch\sdk-probe"`.
+This explicitly spends model calls using the existing `gh` login. `--profile installed` or
+`--profile preview` selects one stack; `--installed-sdk`, `--installed-cli`, and `--model` make
+the inputs explicit. The live runner is Windows-specific and records actual versions and hashes.
+The `installed` profile defaults to the historical CLI fixture `1.0.90-0`, not automatic runtime
+discovery; use `--installed-cli` when evaluating another app-bundled runtime.
+
+Each profile uses its own `COPILOT_HOME`, empty working directory and deny-by-default permissions,
+without real extensions or user configuration discovery. Model cases are bounded, and only
+deterministic marker tools plus one fixture child are offered. Reports stay under the chosen
+scratch directory and must not be committed: they contain local diagnostic paths and identifiers.
+
+The October 6, 2026 experiment established:
+
+| Capability | App-bundled SDK / CLI 1.0.90-0 | SDK 1.0.17-preview.4 / CLI 1.0.92-4 |
+| --- | --- | --- |
+| Typed structured result and request correlation | Passed | Passed |
+| Owner-scoped `setTools`, preserving another client's tool | Not exposed | Passed |
+| Subagent start context, stop response/identity, response rewrite | Not exposed | Passed |
+
+The preview still called the general `onAgentStop` for the child, with the child's
+`input.sessionId` but the parent's `invocation.sessionId`. Keep the existing main-agent guard.
+The lifecycle-specific stop hook instead supplies its child identity in `input.agentId`.
+The first probe assertion incorrectly expected a root-only general stop; replaying the retained
+events with the corrected assertion and negative fixtures verified the measured behavior without
+additional model calls.
+
+These are standalone SDK measurements, **not** app-canvas/notification results or a migration of
+production `tasks.startAgent`. That task API does not acquire schema or reasoning-effort fields
+from this experiment. Approval, evidence validation and reviewer policy remain unchanged.
+Background-RPC hook delivery, multi-child races, in-flight tool replacement and attributed
+immediate steering need separate evidence before adoption.
 
 ### What the tests are worth, measured
 
@@ -380,14 +441,27 @@ First match wins: `$COPILOT_SELF_LEARN_CONFIG`, `<cwd>/.github/self-learn.json`,
 
 ## Commands and tools
 
-Extension slash commands only surface in the CLI's TUI. **The GitHub Copilot app does not show
-them**, so the same functionality is also exposed as a tool the agent can call, which works on
-both surfaces.
+Extension command completion is a CLI TUI capability. App support is tracked in
+[github/app#3056](https://github.com/github/app/issues/3056); use the agent tool when the app does not
+expose these commands, rather than assuming that a registered command appears in its composer.
+
+The review/status tool requests SDK `defer: "never"` so that it remains in the agent's initial
+tool set without a discovery round trip. Other tools retain their normal loading policy.
+This changes availability only, not review scheduling, sub-agent guards or approval requirements.
+
+When diagnosing tools, distinguish registration from schema discovery and actual invocation.
+A repeated `api_tool.list_resources` request can return **zero new schemas even while the
+previously loaded tool remains callable**. Do not treat that response alone as a missing tool or
+recommend a reload on that basis. Try the loaded `self_learn_now` with `action: "status"` first;
+it does not start a review. If a host does not honor preloading, record that separately rather
+than assuming successful extension startup proves the tool was exposed.
 
 | Tool | Purpose |
 | --- | --- |
 | `self_learn_now` (`action: "review"`) | Queue a screening for the end of the turn; escalate on a hit. |
 | `self_learn_now` (`action: "status"`) | Counters and pending-proposal state. |
+| `self_learn_now` (`action: "activity"`) | Current status and the latest 25 retained activity entries. |
+| `self_learn_now` (`action: "enable"` / `"disable"`) | Toggle for this session after a confirmation dialog, on the user's explicit request. |
 | `self_learn_now` (`action: "discard"`) | Drop the pending proposal without writing it. |
 | `self_learn_now` (`action: "events"`) | Which session event types have actually been delivered. |
 | `self_learn_now` (`action: "declines"`) | Lessons already refused, and the ledger's path. |
@@ -402,6 +476,52 @@ In the CLI TUI these are also available as slash commands:
 | `/learn-discard` | Drop the pending proposal without writing it. |
 | `/learn-events` | Dump which event types are actually delivered to extensions. |
 | `/learn-on` / `/learn-off` | Toggle for this session. |
+
+## Activity panel in the app
+
+Ask the agent to **open Self-learn activity**. The extension declares the canvas
+`self-learn-activity`, independently of advisor. It is opened explicitly, not as an automatic
+popup or a synthetic user message.
+
+The panel shows current review/drafting/approval state, enabled/model settings, counters
+since this extension loaded, and the pending proposal's name and mode. Recent reviews (including
+misses), drafts, saved skills and operational errors appear in a filterable, searchable feed. An
+open panel updates without an agent turn; disconnects are labelled stale rather than reporting
+that the extension is still live. The agent-facing `refresh` action returns current status and
+the latest 25 entries; the panel itself can display all retained entries.
+
+Up to the latest 200 entries, within a 2 MiB serialized-history budget, are retained in
+`files/self-learn-activity-<session-id>.json` under the session workspace. Individual messages are
+capped at 4096 characters and marked when truncated; byte-heavy entries can reduce the retained count.
+Without a workspace, they live under `~/.copilot/self-learn/`. History starts when a build with this
+feature loads; it does not import the old machine-wide debug log. A new panel or an extension
+reload reuses the session's history, while counters and enabled overrides retain their existing
+in-memory lifecycle. Unreadable, corrupt or mismatched history is reported visibly and preserved,
+not silently overwritten; fresh events remain available in memory.
+
+The feed does not store the transcript or full draft bodies. Each instance serves only this
+session's snapshot from a random capability URL on loopback, without CORS, with host/origin
+checks and literal-text rendering. Closing it stops its server, streams and timer.
+
+The **Session settings** section can enable or disable self-learn and change its screening/drafting
+model for the running session. Edit the fields, then click **Apply** once; Reset discards unsent
+edits. There is no extra Review step, agent turn or idle-host dialog. The model field takes an
+identifier; model availability is still determined by the normal model-request path. A change
+affects later requests, not an already-running screening or draft.
+
+The bounded JSON POST requires the panel's own origin and capability URL, validates all desired
+fields before mutation, and rejects stale expected settings or an already-open tool/skill
+confirmation before changing state. A failed
+or disconnected response is not presented as proof that nothing happened: the panel reports an
+unknown outcome and disables resubmission until an explicit refresh succeeds. Reset
+does not erase that warning or pretend to undo a submitted request. No global config file is edited.
+
+The panel cannot start a review, discard proposals or write skills. Use `self_learn_now` for those
+operations; **every skill write still requires the existing approval dialog**, never a panel
+refresh, setting change or opening a pending proposal.
+Tool-initiated enable/disable changes require a separate confirmation before mutation. Declining,
+cancelling or an unavailable dialog leaves the setting unchanged; status and activity reads never
+prompt. CLI `/learn-on` and `/learn-off` keep their existing direct-user behavior.
 
 ## Runtime findings
 
@@ -460,14 +580,16 @@ this extension's *own* screener prompt, since the screener is started as an agen
 next spoke was released early. Measured over one real session: 20 `userPromptSubmitted` dispatches,
 only 5 of them actually the user.
 
-Hook payloads carry no agent identity, but hook dispatches are still attributable. The event log
-brackets each one in `hook.start` / `hook.end` events that **do** carry `agentId`, correlated by
-`hookInvocationId`, and `hook.start` reaches the extension before the handler runs (verified with a
-throwaway probe: `hook.start` arrived 1.1 s ahead, and the dispatch resolved to SUBAGENT). Since the
-main agent and a sub-agent can be inside the same hook type concurrently, the open brackets are
-matched on the prompt itself rather than on hook type alone. Attribution deliberately **fails open**
-— an unattributable dispatch is treated as the user's, which preserves behaviour instead of silently
-disabling the extension.
+Prompt capture uses `user.message`, whose root events omit `agentId` and whose child events carry
+it. It no longer mutates state from `onUserPromptSubmitted`: observed child-opening hook brackets
+can omit both agent identity and parent tool identity, so matching an anonymous bracket by prompt
+text cannot establish ownership. Waiting a fixed interval does not repair missing identity.
+
+A child prompt must not change the captured main goal, reset main-tool counters, or release a held
+proposal. The registered-extension regressions cover bare UUID, `bg-` and task-style child IDs,
+identical main/child prompt text, and held-proposal persistence. Main-session messages forwarded
+from another agent remain context as before: `source` is not a replacement for `agentId` when
+classifying which agent receives a message, nor is a root message necessarily human-authored.
 
 `session.idle` and `session.task_complete` were checked for the same exposure and do not have it:
 across a full session, no event of either type ever carried an `agentId`. See below for the wider
@@ -572,8 +694,10 @@ turn earlier.
 
 ## Getting text in front of the user
 
-**In the GitHub Copilot app, extension output currently does not render at all — and this is a
-regression in the app, which has happened before.** Asaf filed it as
+**The activity panel and agent tools do not depend on the app rendering `session.log()`.**
+The measurements below describe a historical app regression, tracked again in
+[github/app#3373](https://github.com/github/app/issues/3373). Check the current release rather than
+treating a historical observation as a permanent API limitation. The original report was
 [github/app#2765](https://github.com/github/app/issues/2765), *"Extensions who send `info` or
 `warning` level logs are not shown in the app"*, on Aug 11 at 12:57:14 against app `1.1.6`. It was
 closed COMPLETED and the release bot confirms it was **fixed in app v1.1.8** on Aug 12. The app here
@@ -637,9 +761,9 @@ never treated as a suspect, even though the transcript had shown all along that 
 being emitted and recorded exactly as intended. When output is correct at every layer you control,
 suspect the layer you do not.
 
-Consequences while it lasts: a **hit** is announced by the approval dialog (`session.ui`, which does
-still work), and a **miss** is not announced. The announcement path is deliberately *kept* rather
-than deleted, because the mechanism is correct and worked before app v1.1.10 — it will work again.
+The activity feed records both hits and misses independently of timeline rendering. Approval
+still uses `session.ui`. The timeline path is kept for CLI users and hosts that render it; the
+panel is not a claim that native app banners or extension slash commands have been repaired.
 
 ### What `ephemeral: true` actually does
 

@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Self-learn activity</title>
+  <link rel="stylesheet" href="./panel.css">
+  <script type="module" src="./panel-client.mjs"></script>
+</head>
+<body>
+  <main>
+    <header>
+      <div><p class="eyebrow">Session companion</p><h1>Self-learn activity</h1></div>
+      <button id="refresh" type="button">Refresh</button>
+    </header>
+    <p id="connection" role="status" aria-live="polite">Connecting...</p>
+    <p id="error" class="error" role="alert" hidden></p>
+    <p id="storage-error" class="error" role="alert" hidden></p>
+    <section aria-labelledby="status-title">
+      <h2 id="status-title">Current status <span id="phase" class="badge">Loading</span></h2>
+      <p id="configuration"></p>
+      <div class="metrics">
+        <div><strong id="screened">-</strong><span>Reviews</span></div>
+        <div><strong id="hits">-</strong><span>Lessons found</span></div>
+        <div><strong id="written">-</strong><span>Skills written</span></div>
+      </div>
+      <p class="muted">Counters are since this extension loaded; history below survives reloads.</p>
+      <p id="pending"></p>
+      <p id="last-error" class="error" hidden></p>
+    </section>
+    <section aria-labelledby="settings-title">
+      <h2 id="settings-title">Session settings</h2>
+      <form id="settings" novalidate>
+        <label class="toggle"><input id="enabled" type="checkbox" disabled> Enable self-learn</label>
+        <label class="model-setting">Model (screening and drafting)
+          <input id="model" type="text" required maxlength="200" autocomplete="off" spellcheck="false" disabled>
+        </label>
+        <p class="muted">Changes affect this session only, not your config file. They do not cancel running work or clear a pending proposal. Model changes apply to later model requests.</p>
+        <div class="settings-buttons">
+          <button id="apply-setting" type="submit" disabled>Apply</button>
+          <button id="reset-setting" type="button" hidden>Reset</button>
+        </div>
+      </form>
+      <p id="setting-result" role="status" aria-live="polite"></p>
+    </section>
+    <section aria-labelledby="activity-title">
+      <div class="activity-heading"><h2 id="activity-title">Recent activity</h2><span id="count" class="muted"></span></div>
+      <div class="filters">
+        <label>Show <select id="kind">
+          <option value="all">All activity</option>
+          <option value="review">Reviews</option>
+          <option value="draft">Drafts</option>
+          <option value="proposal">Proposals</option>
+          <option value="saved">Saved skills</option>
+          <option value="error">Errors</option>
+          <option value="notice">Notices</option>
+        </select></label>
+        <label class="search">Search <input id="search" type="search" placeholder="Filter messages"></label>
+      </div>
+      <p id="empty" class="muted">Waiting for activity...</p>
+      <ol id="entries" aria-label="Activity, newest first"></ol>
+    </section>
+    <footer>
+      <p>Apply changes these session settings directly. Agent-tool changes and skill writes still require their existing approval dialogs.</p>
+      <p id="session" class="muted"></p>
+    </footer>
+  </main>
+</body>
+</html>

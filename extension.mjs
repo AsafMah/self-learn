@@ -5,7 +5,9 @@
 //
 // Companion to the `advisor` extension. See README.md.
 
-import { joinSession } from "@github/copilot-sdk/extension";
+import { joinSession, createCanvas } from "@github/copilot-sdk/extension";
+import { createActivityJournal, activityKind, HISTORY_LIMIT } from "./activity.mjs";
+import { createActivityPanel } from "./panel.mjs";
 import {
     readFileSync,
     existsSync,
@@ -112,9 +114,11 @@ const state = {
     toolCallsThisTurn: 0,
     lastEventIndex: 0,
     screeningInFlight: false,
+    draftingInFlight: false,
     reviewRequested: null,
     rejectedProposals: 0,
     resolvingProposal: false,
+    confirmingControl: false,
     // Announcements cannot be made from `session.idle`: screening finishes after the turn has
     // ended, and an extension log with no live turn to attach to renders nowhere. Measured twice —
     // the call succeeds, writes nothing, and the user sees silence. So the text is parked here and
@@ -175,49 +179,20 @@ const SUBAGENT_REFUSAL =
     "self-learn does not run for sub-agent tasks. Finish your own task and report the result — " +
     "the main agent decides whether the work produced a durable lesson.";
 
-// A sub-agent's opening prompt is dispatched to `onUserPromptSubmitted` exactly like the user's
-// own, and hook payloads carry no agent identity. Left unguarded, every subtask's brief — and
-// self-learn's own screener prompt, which is itself started as an agent — overwrites `state.goal`,
-// zeroes the turn's tool count and releases a proposal that was deliberately held back until the
-// user next spoke. Measured over one real session: 20 dispatches, only 5 of them the user.
-//
-// Hook dispatches are attributable even though their payloads are not: the event log brackets each
-// one in `hook.start` / `hook.end` events that do carry `agentId`, correlated by
-// `hookInvocationId`, and `hook.start` reaches the extension before the handler runs.
-const OPEN_HOOK_MEMORY = 50;
-const openHookDispatches = new Map();
-
-function noteHookStart(event) {
-    const data = event?.data;
-    if (!data?.hookInvocationId) return;
-    openHookDispatches.set(data.hookInvocationId, {
-        agentId: event.agentId ?? null,
-        hookType: data.hookType,
-        prompt: data.input?.prompt,
-    });
-    // Guards against a leak should a `hook.end` ever go missing. Insertion order, so oldest first.
-    if (openHookDispatches.size > OPEN_HOOK_MEMORY) {
-        openHookDispatches.delete(openHookDispatches.keys().next().value);
+// Opening prompt hooks can be anonymous for both main and child agents. The later user.message
+// event has ownership; wait for it rather than guessing from an unmatched hook or a timer.
+function handleUserMessage(event) {
+    if (event?.agentId) return;
+    const prompt = event?.data?.content;
+    if (typeof prompt !== "string") return;
+    state.goal = prompt;
+    state.toolCallsThisTurn = 0;
+    state.rejectedProposals = 0;
+    if (state.pendingProposal?.deferred) {
+        state.pendingProposal.deferred = false;
+        persistPendingProposal(session);
+        debug(`proposal "${state.pendingProposal.name}" is now eligible for approval`);
     }
-}
-
-function noteHookEnd(event) {
-    const id = event?.data?.hookInvocationId;
-    if (id) openHookDispatches.delete(id);
-}
-
-// The main agent and a sub-agent can be inside the same hook type concurrently, so the open
-// brackets are matched on the prompt itself rather than on hook type alone. Attribution fails
-// open: a dispatch that cannot be attributed is treated as the user's, which preserves the
-// extension's behaviour rather than silently disabling it.
-async function isSubAgentPrompt(prompt) {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    for (const dispatch of openHookDispatches.values()) {
-        if (dispatch.hookType === "userPromptSubmitted" && dispatch.prompt === prompt) {
-            return dispatch.agentId !== null;
-        }
-    }
-    return false;
 }
 
 // Every session on the machine appends to this one file, so an unattributed line is close to
@@ -225,8 +200,11 @@ async function isSubAgentPrompt(prompt) {
 // screener produced a verdict. Set once the session exists — `debug` runs before that, so it
 // cannot reach `session` directly without tripping the temporal dead zone.
 let sessionTag = "";
+let activity = null;
 
 function debug(message) {
+    const kind = activityKind(message);
+    if (kind) activity?.record(kind, message);
     const path = cfg("debugLog");
     if (!path) return;
     try {
@@ -236,47 +214,16 @@ function debug(message) {
     }
 }
 
-// The single place user-facing text is emitted, so there is one place to be honest about how
-// little of it the user actually sees.
-//
-// **In the GitHub Copilot app this currently renders nothing — an app regression, isolated by
-// measurement, not a mistake in here.** The same CLI (1.0.80) running the same extension prints
-// `● self-learn ready` to stdout in a plain terminal, so the CLI and this code are both fine and
-// only the app fails to display it. The same symptom was github/app#2765 ("Extensions who send
-// info or warning level logs are not shown in the app"), fixed in app v1.1.8; the app is now
-// 1.1.10 and it is back. Also verified with the user watching the window live, so it is not an
-// announcement auto-dismissing before he looked. Four hypotheses were burned looking for the
-// mistake in this extension before the host was suspected at all, though the transcript had shown
-// the whole time that the messages were emitted and recorded exactly as intended.
-//
-// So this path is deliberately kept rather than deleted: it is correct, and it worked before and
-// will work again. Until then a hit is surfaced by the approval dialog (`session.ui` still works)
-// and a miss is not surfaced.
-//
-// `ephemeral: true` is NOT passed, and must not be. It never decided visibility — it looked
-// decisive purely because the startup line was both the only call passing it and the only call
-// made during init, a confounded variable the advisor extension warned about before the sweep
-// that acted on it. What it actually means, measured under the CLI where rendering still works,
-// is **transient**: the line is drawn and then dropped on redraw, and no `session.info` event is
-// written to `events.jsonl`. A coherent feature, and the wrong one here — the whole point is a
-// record the user can find afterwards.
-//
-// While the host is regressed that transcript is the only read-back channel there is, so losing it
-// was the entire cost of the flag, for none of the benefit.
-//
-// The one surface still proven to work is `session.ui` (`elicitation`/`confirm`/`select`/`input`),
-// every one of which demands an answer. The init banner is *not* one — that was an assumption, and
-// a fresh session disproved it.
-//
-// Severity belongs in the text, never in `level`. The host turns any `session.error` whose
-// errorType is not `model_call` into a *terminal* fault: it sets `hasError`, stops autopilot with
-// reason "error" and marks the session failed. Reporting a failed draft is not a session failure.
-// That one is unrelated to rendering and matters on every host.
+// Keep the CLI timeline record, and mirror it in the independent activity feed. App consumers
+// may persist session.info without displaying it (github/app#3373); the panel does not depend on
+// that renderer. Ephemeral logs deliberately lose the durable record, so are unsuitable here.
+// Do not use level:"error": the host treats non-model session.error events as terminal faults.
 async function say(text) {
+    activity?.record("notice", text);
     try {
         await session.log(text);
     } catch (err) {
-        // Nothing renders in this host anyway, so a failure here costs the transcript record.
+        // The activity feed still has the message even if timeline logging fails.
         debug(`say failed: ${err?.message ?? err}`);
     }
 }
@@ -695,20 +642,21 @@ async function runScreener(session, prompt, { recognise = looksLikeVerdict, labe
     screenerWatch = watch;
 
     let agentId;
+    const model = cfg("screenerModel");
     try {
         ({ agentId } = await rpc.tasks.startAgent({
             agentType: cfg("agentType"),
             prompt,
             name: "self-learn",
             description: SCREENER_DESCRIPTION,
-            model: cfg("screenerModel"),
+            model,
         }));
     } catch (err) {
         screenerWatch = null;
         throw err;
     }
     watch.agentId = agentId;
-    debug(`${label} ${agentId} started on ${cfg("screenerModel")} (baseline ${baseline})`);
+    debug(`${label} ${agentId} started on ${model} (baseline ${baseline})`);
 
     const deadline = Date.now() + cfg("timeoutMs");
     let seen = false;
@@ -1178,7 +1126,14 @@ async function screenAndDraft(session, opts = {}) {
         return verdict;
     }
 
-    const result = await draft(session, verdict, transcript);
+    let result;
+    state.draftingInFlight = true;
+    debug(`drafting started: ${verdict.target} "${verdict.skill}"`);
+    try {
+        result = await draft(session, verdict, transcript);
+    } finally {
+        state.draftingInFlight = false;
+    }
 
     if (result.decline) {
         debug(`drafter declined: ${result.reason}`);
@@ -1490,10 +1445,130 @@ function restorePendingProposal(session) {
     }
 }
 
+function statusSnapshot() {
+    const p = state.pendingProposal;
+    return {
+        enabled: cfg("enabled"),
+        write: cfg("write"),
+        autoScreen: cfg("autoScreen"),
+        model: cfg("screenerModel"),
+        agentType: cfg("agentType"),
+        phase: state.confirmingControl ? "Control confirmation"
+            : state.resolvingProposal ? "Approval in progress"
+            : state.draftingInFlight ? "Drafting"
+            : state.screeningInFlight ? "Reviewing"
+            : p ? "Proposal pending"
+            : state.reviewRequested ? "Review queued"
+            : cfg("enabled") ? "Idle" : "Disabled",
+        screenedTurns: state.screenedTurns,
+        hits: state.hits,
+        written: state.written,
+        toolCallsThisTurn: state.toolCallsThisTurn,
+        reviewQueued: Boolean(state.reviewRequested),
+        pending: p ? { name: p.name, mode: p.mode, deferred: Boolean(p.deferred) } : null,
+        lastError: state.lastError,
+    };
+}
+
+function statusText() {
+    const s = statusSnapshot();
+    return [
+        `enabled: ${s.enabled}, write: ${s.write}, autoScreen: ${s.autoScreen}`,
+        `screener: ${s.model} (${s.agentType})`,
+        `state: ${s.phase}`,
+        `turns screened: ${s.screenedTurns}, hits: ${s.hits}, written: ${s.written}`,
+        `queued review: ${s.reviewQueued ? "yes (runs at end of turn)" : "no"}`,
+        `pending: ${s.pending ? `${s.pending.mode} "${s.pending.name}"${s.pending.deferred ? " (held)" : " (awaiting approval)"}` : "none"}`,
+        `last error: ${s.lastError ?? "none"}`,
+        `min tools: ${cfg("minToolCalls")} per turn`,
+        `config: ${config._configPath ?? "built-in defaults"}`,
+        `last verdict: ${state.lastVerdict ? (state.lastVerdict.worthLearning
+            ? `${state.lastVerdict.target} ${state.lastVerdict.skill}`
+            : `no - ${state.lastVerdict.reason ?? "n/a"}`) : "none"}`,
+    ].join("\n");
+}
+
+function setEnabled(enabled, source) {
+    state.sessionOverrides.enabled = enabled;
+    const text = `self-learn ${enabled ? "enabled" : "disabled"} for this session`;
+    debug(text + (source === "canvas" ? " (canvas)" : ""));
+    return text;
+}
+
+async function confirmEnabledChange(enabled) {
+    const reject = (textResultForLlm) => ({ textResultForLlm, resultType: "rejected" });
+    if (state.confirmingControl || state.resolvingProposal) {
+        return reject("A self-learn confirmation is already open. Nothing changed.");
+    }
+    state.confirmingControl = true;
+    try {
+        const approved = await session.ui.confirm(
+            `${enabled ? "Enable" : "Disable"} self-learn for this session? This changes the running ` +
+            "session only; the configuration file is not modified. It does not cancel an ongoing " +
+            "review or clear a pending proposal.",
+        );
+        if (approved !== true) {
+            activity?.record("notice", "Self-learn setting change declined; nothing changed.");
+            return reject("The user declined or cancelled the self-learn setting change. Nothing changed.");
+        }
+        return setEnabled(enabled);
+    } catch (error) {
+        const message = `Self-learn setting confirmation failed: ${error?.message ?? error}. Nothing changed.`;
+        activity?.record("error", message);
+        debug(message);
+        return reject(message);
+    } finally {
+        state.confirmingControl = false;
+    }
+}
+
+function discardPending() {
+    if (!state.pendingProposal) return "No pending proposal.";
+    const name = state.pendingProposal.name;
+    state.pendingProposal = null;
+    persistPendingProposal(session);
+    const text = `proposal "${name}" discarded by request`;
+    debug(text);
+    return `Discarded pending proposal "${name}".`;
+}
+
+function activitySnapshot() {
+    if (!activity) throw new Error("Self-learn is still initializing");
+    return {
+        sessionId: session.sessionId,
+        status: statusSnapshot(),
+        historyLimit: HISTORY_LIMIT,
+        ...activity.snapshot(),
+    };
+}
+
+const activityPanel = createActivityPanel({
+    getSnapshot: activitySnapshot,
+    applySettings: ({ expected, desired }) => {
+        if (state.confirmingControl || state.resolvingProposal) {
+            throw Object.assign(new Error("Another confirmation is open. Nothing changed; try again after it closes."), { statusCode: 409 });
+        }
+        if (cfg("enabled") !== expected.enabled || cfg("screenerModel") !== expected.model) {
+            throw Object.assign(new Error("Settings changed while you were editing. Reset the form before applying again."), { statusCode: 409 });
+        }
+        if (cfg("screenerModel") !== desired.model) {
+            state.sessionOverrides.screenerModel = desired.model;
+            activity?.record("notice", `Self-learn model set to ${desired.model} (canvas)`);
+        }
+        if (cfg("enabled") !== desired.enabled) setEnabled(desired.enabled, "canvas");
+        return `Session settings applied: ${desired.enabled ? "enabled" : "disabled"}, model ${desired.model}.`;
+    },
+    onError: (error) => debug(`activity panel error: ${error.message}`),
+});
+
 const session = await joinSession({
+    canvases: [createCanvas(activityPanel.declaration)],
     tools: [
         {
             name: "self_learn_now",
+            // Keep review/status directly callable even when a resumed host has already
+            // cached its deferred schema but no longer exposes that schema to the agent.
+            defer: "never",
             description:
                 "Run a self-learn review: check whether recent work produced a durable, reusable " +
                 "lesson worth saving as a skill, and if so draft it for the user to approve.\n" +
@@ -1501,18 +1576,22 @@ const session = await joinSession({
                 "when you have just FINISHED a substantive piece of work — a task completed, a " +
                 "bug root-caused, a non-obvious behaviour discovered — and something was learned " +
                 "that would help in a future, unrelated session. Do not call it mid-task, after " +
-                "routine edits, or when the turn was simple question-answering.",
+                "routine edits, or when the turn was simple question-answering.\n" +
+                "Also supports status, recent activity, and explicit requests to enable or disable " +
+                "self-learn for this session. Use these actions instead of slash commands in the app.",
             parameters: {
                 type: "object",
                 properties: {
                     action: {
                         type: "string",
-                        enum: ["review", "status", "discard", "events", "declines"],
+                        enum: ["review", "status", "activity", "enable", "disable", "discard", "events", "declines"],
                         description:
                             "review: screen, and draft a skill on a hit. status: counters and " +
                             "pending state. discard: drop the pending proposal without writing it. " +
                             "events: which session event types have actually been delivered. " +
-                            "declines: lessons already refused, which the screener will not raise again.",
+                            "declines: lessons already refused, which the screener will not raise again. " +
+                            "activity: recent session activity. enable/disable: change only this session, " +
+                            "when explicitly requested by the user; a confirmation dialog is required.",
                     },
                 },
                 required: [],
@@ -1527,16 +1606,18 @@ const session = await joinSession({
                 const action = args?.action ?? "review";
 
                 if (action === "status") {
-                    const p = state.pendingProposal;
-                    return [
-                        `enabled: ${cfg("enabled")}, write: ${cfg("write")}, autoScreen: ${cfg("autoScreen")}`,
-                        `screener: ${cfg("screenerModel")} (${cfg("agentType")})`,
-                        `turns screened: ${state.screenedTurns}, hits: ${state.hits}, written: ${state.written}`,
-                        `queued review: ${state.reviewRequested ? "yes (runs at end of turn)" : "no"}`,
-                        `pending: ${p ? `${p.mode} "${p.name}"${p.deferred ? " (held)" : " (awaiting approval)"}` : "none"}`,
-                        `last error: ${state.lastError ?? "none"}`,
-                    ].join("\n");
+                    return statusText();
                 }
+
+                if (action === "activity") {
+                    const snapshot = activitySnapshot();
+                    const rows = snapshot.entries.slice(-25).reverse()
+                        .map((entry) => `${entry.at} [${entry.kind}] ${entry.message}`);
+                    return `${statusText()}\n\nRecent activity (latest ${rows.length} of ${snapshot.entries.length}):\n${rows.join("\n") || "None recorded."}` +
+                        (snapshot.storageError ? `\n\n${snapshot.storageError}` : "");
+                }
+
+                if (action === "enable" || action === "disable") return confirmEnabledChange(action === "enable");
 
                 if (action === "events") {
                     const rows = [...deliveredTypes.entries()].sort((a, b) => b[1] - a[1]);
@@ -1567,11 +1648,11 @@ const session = await joinSession({
                 }
 
                 if (action === "discard") {
-                    if (!state.pendingProposal) return "No pending proposal.";
-                    const name = state.pendingProposal.name;
-                    state.pendingProposal = null;
-                    persistPendingProposal(session);
-                    return `Discarded pending proposal "${name}".`;
+                    return discardPending();
+                }
+
+                if (action !== "review") {
+                    return { textResultForLlm: `Unknown self-learn action: ${action}`, resultType: "rejected" };
                 }
 
                 if (state.pendingProposal) {
@@ -1833,22 +1914,6 @@ const session = await joinSession({
             }
         },
 
-        onUserPromptSubmitted: async (input) => {
-            const prompt = input.prompt ?? "";
-            if (await isSubAgentPrompt(prompt)) {
-                debug(`ignored userPromptSubmitted from a sub-agent (${prompt.length} chars)`);
-                return;
-            }
-            state.goal = prompt;
-            state.toolCallsThisTurn = 0;
-            state.rejectedProposals = 0;
-            // A held proposal becomes eligible once the user has taken their next turn.
-            if (state.pendingProposal?.deferred) {
-                state.pendingProposal.deferred = false;
-                persistPendingProposal(session);
-                debug(`proposal "${state.pendingProposal.name}" is now eligible for approval`);
-            }
-        },
     },
 
     commands: [
@@ -1856,23 +1921,7 @@ const session = await joinSession({
             name: "learn",
             description: "Show self-learn status",
             handler: async () => {
-                const v = state.lastVerdict;
-                await say(
-                    [
-                        "self-learn status",
-                        `enabled:        ${cfg("enabled")}`,
-                        `screener:       ${cfg("screenerModel")} (${cfg("agentType")})`,
-                        `min tools:      ${cfg("minToolCalls")} per turn`,
-                        `config:         ${config._configPath ?? "built-in defaults"}`,
-                        `turns screened: ${state.screenedTurns}`,
-                        `hits:           ${state.hits}`,
-                        `skills written: ${state.written}`,
-                        `pending:        ${state.pendingProposal ? `${state.pendingProposal.mode} "${state.pendingProposal.name}"${state.pendingProposal.deferred ? " (held)" : " (awaiting approval)"}` : "none"}`,
-                        `write enabled:  ${cfg("write")}`,
-                        `last verdict:   ${v ? (v.worthLearning ? `${v.target} ${v.skill}` : `no — ${v.reason ?? "n/a"}`) : "none"}`,
-                        `last error:     ${state.lastError ?? "none"}`,
-                    ].join("\n"),
-                );
+                await say(`self-learn status\n${statusText()}`);
             },
         },
         {
@@ -1921,33 +1970,31 @@ const session = await joinSession({
             name: "learn-discard",
             description: "Discard the pending self-learn proposal without writing it",
             handler: async () => {
-                if (!state.pendingProposal) {
-                    await say("self-learn: no pending proposal");
-                    return;
-                }
-                const name = state.pendingProposal.name;
-                state.pendingProposal = null;
-                persistPendingProposal(session);
-                await say(`self-learn: discarded pending proposal "${name}"`);
+                await say(`self-learn: ${discardPending()}`);
             },
         },
         {
             name: "learn-off",
             description: "Disable self-learn for this session",
             handler: async () => {
-                state.sessionOverrides.enabled = false;
-                await say("self-learn: disabled");
+                await say(setEnabled(false));
             },
         },
         {
             name: "learn-on",
             description: "Enable self-learn for this session",
             handler: async () => {
-                state.sessionOverrides.enabled = true;
-                await say("self-learn: enabled");
+                await say(setEnabled(true));
             },
         },
     ],
+});
+
+sessionTag = `[${String(session.sessionId ?? "?").slice(0, 8)}] `;
+activity = createActivityJournal({
+    file: join(dirname(pendingProposalPath(session)), `self-learn-activity-${session.sessionId}.json`),
+    sessionId: session.sessionId,
+    onError: (message) => debug(message),
 });
 
 // Counted from the event log rather than from `onPostToolUse`, because tool-use hooks also fire
@@ -1957,6 +2004,10 @@ function countToolCall(event) {
     if (event?.agentId) return;
     const toolName = event?.data?.toolName;
     if (typeof toolName === "string" && OWN_TOOLS.has(toolName)) return;
+    const args = event?.data?.arguments;
+    if ((toolName === "open_canvas" || toolName === "list_canvas_capabilities") &&
+        args?.canvasId === "self-learn-activity") return;
+    if (toolName === "invoke_canvas_action" && activityPanel.ownsInstance(args?.instanceId)) return;
     state.toolCallsThisTurn++;
 }
 
@@ -1971,10 +2022,11 @@ session.on((event) => {
     const key = `${event?.type}${event?.agentId ? "@sub" : ""}`;
     deliveredTypes.set(key, (deliveredTypes.get(key) ?? 0) + 1);
     if (event?.type === "external_tool.requested") noteSubAgentToolCall(event);
-    if (event?.type === "user.message") noteScreenerPrompt(event);
+    if (event?.type === "user.message") {
+        noteScreenerPrompt(event);
+        handleUserMessage(event);
+    }
     if (event?.type === "assistant.message") noteScreenerMessage(event);
-    if (event?.type === "hook.start") noteHookStart(event);
-    if (event?.type === "hook.end") noteHookEnd(event);
     if (event?.type === "tool.execution_start") {
         noteSubAgentToolCall(event);
         countToolCall(event);
@@ -2077,8 +2129,6 @@ session.on("session.idle", (event) => {
         await screenAndDraft(session);
     })().catch((err) => debug(`idle handler threw: ${err?.message ?? err}`));
 });
-
-sessionTag = `[${String(session.sessionId ?? "?").slice(0, 8)}] `;
 
 await say(
     `self-learn ready — review on request` +
