@@ -553,7 +553,8 @@ Respond with EXACTLY ONE JSON object and nothing else:
     since it rewrites the whole skill.
   - "new" — no skill above owns the subject. Give a short kebab-case name.
   Merely adjacent is not enough: mistargeting corrupts an unrelated skill.
-- Skills marked [READ-ONLY] belong to a repository, a plugin or the runtime, and cannot be changed
+- Skills marked [READ-ONLY] are outside the skills directory this extension writes to — a
+  repository's, a plugin's, the runtime's, or another personal one — and cannot be changed
   here. "extend" and "refine" are for unmarked skills only: a lesson in a read-only skill's subject
   is "new", with its own name. This overrides the [IN USER'S INSTRUCTIONS] preference below.
 - Skills marked [IN USER'S INSTRUCTIONS] are named in the user's own instruction files, so the

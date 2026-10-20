@@ -236,6 +236,8 @@ reviewing or committing would mark them.
   user's own nor shadow the read-only one. The approval dialog says the lesson was re-targeted.
 - When `skillsRoot` is not configured, the root is derived **only from personal skills**: the
   directory holding a `personal-agents` skill, else a `personal-copilot` one, else `~/.agents/skills`.
+  When both kinds are installed, skills in the other personal directory are outside the root and so
+  read-only too; set `skillsRoot` to choose which one is written.
   Project, plugin and custom skills never decide it — deriving from whichever skill was listed first
   once made a repository's `.github/skills` the write root. The runtime has an experimental
   skill-discovery RPC that reports a preferred creation directory; it is not used while it is
