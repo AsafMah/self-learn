@@ -2,7 +2,6 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
     parseVerdict,
-    looksLikeVerdict,
     sanitize,
     normaliseSkillFilePath,
     referencedSkillNames,
@@ -12,7 +11,6 @@ import {
     appendSection,
     parseDraft,
     isMainAgentStop,
-    looksLikeDraft,
     extractJsonObjects,
 } from "./lib.mjs";
 
@@ -118,26 +116,6 @@ test("a brace inside a quoted string does not break object scanning", () => {
         rationale: "the reply mentioned {braces} inline",
     });
     assert.equal(parseVerdict(raw, quote).worthLearning, true);
-});
-
-test("looksLikeVerdict accepts exactly what parseVerdict will parse", () => {
-    // The screener is cut off on this predicate, so a message it accepts but the parser rejects
-    // would lose the verdict entirely.
-    assert.equal(looksLikeVerdict(verdictJson()), true);
-    assert.equal(looksLikeVerdict("```json\n" + verdictJson() + "\n```"), true);
-    assert.equal(looksLikeVerdict("still thinking about it"), false);
-    assert.equal(looksLikeVerdict('{"notcriteria": 1}'), false);
-});
-
-test("neither recogniser fires on an empty or contentless reply", () => {
-    // The advisor extension found that its own `parseVerdict("")` returned a clean object rather
-    // than failing, so an empty first poll cancelled a sub-agent that was still working and was
-    // reported as a confident "no concerns". These predicates require specific keys rather than
-    // merely a successful parse, so they must reject anything that carries no verdict or draft.
-    for (const empty of ["", "   ", "\n\t", null, undefined, "{}", "[]"]) {
-        assert.equal(looksLikeVerdict(empty), false, `verdict recognised ${JSON.stringify(empty)}`);
-        assert.equal(looksLikeDraft(empty), false, `draft recognised ${JSON.stringify(empty)}`);
-    }
 });
 
 test("sanitize strips smuggled tags and refuses prompt injection", () => {
@@ -423,6 +401,18 @@ test("a reply with no JSON at all is an error, not a silent empty draft", () => 
     assert.equal(d.proposal, undefined);
 });
 
+test("an empty or contentless stop reply is neither a lesson nor a draft", () => {
+    // The stop hook hands over whatever the sub-agent ended its turn with, which can be nothing.
+    // The advisor extension once read an empty reply as a confident "no concerns"; here it must
+    // read as a failure to answer.
+    for (const empty of ["", "   ", "\n\t", "{}", "[]"]) {
+        const v = parseVerdict(empty, "transcript");
+        assert.equal(v.worthLearning, false, `verdict from ${JSON.stringify(empty)}`);
+        assert.ok(v.reason, `no reason for ${JSON.stringify(empty)}`);
+        assert.ok(parseDraft(empty, VERDICT).error, `draft from ${JSON.stringify(empty)}`);
+    }
+});
+
 test("a reply whose only JSON lacks a body is an error", () => {
     const d = parseDraft(JSON.stringify({ section: "x", description: "y" }), VERDICT);
     assert.ok(d.error);
@@ -435,35 +425,6 @@ test("an over-long section is left long enough to fail validation rather than tr
         /section/,
         "an over-long section must be reported, not silently truncated into a passing one",
     );
-});
-
-// --- early-cancel recognition ----------------------------------------------
-
-test("a drafter reply is recognised as a draft", () => {
-    assert.equal(looksLikeDraft(draftJson()), true);
-});
-
-test("a declining drafter reply is recognised", () => {
-    assert.equal(looksLikeDraft(JSON.stringify({ decline: true, reason: "no" })), true);
-});
-
-test("a draft is not mistaken for a verdict, and vice versa", () => {
-    // This is the regression that shipped: the early cancel recognised only verdict-shaped
-    // replies, so every drafter ran to completion and the CLI announced it to the main agent.
-    assert.equal(looksLikeVerdict(draftJson()), false);
-    assert.equal(looksLikeDraft(verdictJson()), false);
-});
-
-test("an unfinished or empty draft is not recognised", () => {
-    assert.equal(looksLikeDraft(""), false);
-    assert.equal(looksLikeDraft("still thinking about it"), false);
-    assert.equal(looksLikeDraft(JSON.stringify({ body: "   " })), false);
-    assert.equal(looksLikeDraft(JSON.stringify({ section: "x" })), false);
-    assert.equal(looksLikeDraft(undefined), false);
-});
-
-test("prose around a draft still counts as recognised", () => {
-    assert.equal(looksLikeDraft(`Here you go:\n${draftJson()}\ndone`), true);
 });
 
 // --- agent-stop filtering --------------------------------------------------

@@ -60,6 +60,91 @@ test("subagent calls cannot use new control or activity actions", async (t) => {
     assert.match(await host.tool("status"), /enabled: true/);
 });
 
+test("a tool call carrying a sub-agent id is refused without the event log", async (t) => {
+    const host = await boot(t);
+    const propose = host.options.tools.find((tool) => tool.name === "propose_skill");
+    const child = { toolCallId: "never-seen-call", agentId: "child-agent" };
+    for (const action of ["status", "review", "disable"]) {
+        assert.equal((await host.tool(action, child)).resultType, "rejected");
+    }
+    const proposal = { mode: "new", name: "fixture-lesson", description: "Fixture", body: "Fixture body" };
+    assert.equal((await propose.handler(proposal, child)).resultType, "rejected");
+    assert.equal(host.confirmations.length, 0);
+    assert.match(await host.tool("status", { toolCallId: "main-call", agentId: null }), /queued review: no/);
+});
+
+const rejectingVerdict = (why) => JSON.stringify({
+    criteria: Object.fromEntries(["surprising", "expensive", "undiscoverable", "transferable", "uncovered"]
+        .map((name) => [name, { pass: false, why: name === "surprising" ? why : "fixture" }])),
+    target: "new", skill: "fixture", rationale: "fixture",
+});
+
+async function bootScreening(t, config = {}) {
+    const host = await boot(t, { config: { pollIntervalMs: 20, timeoutMs: 2000, ...config } });
+    host.events.push({ type: "user.message", data: { content: "Fix the fixture bug" } });
+    return host;
+}
+
+const startedAgent = (host) => host.rpcCalls.find(([kind]) => kind === "tasks.startAgent")[1];
+const taskCalls = (host) => host.rpcCalls.filter(([kind]) => kind !== "tasks.startAgent");
+
+test("an owned screener's stop hook delivers its reply and cancels exactly that task", async (t) => {
+    const host = await bootScreening(t);
+    const hookResults = [];
+    host.onStartAgent = async (agentId) => {
+        // The main agent's own task-tool children stop through the same hook.
+        hookResults.push(await host.stopSubagent("someone-elses-agent", rejectingVerdict("stranger reply")));
+        hookResults.push(await host.stopSubagent(agentId, rejectingVerdict("hook reply")));
+    };
+    await host.command("learn-now");
+    assert.match(host.logs.at(-1), /nothing worth learning \(failed: surprising \(hook reply\)/);
+    const agentId = startedAgent(host);
+    assert.deepEqual(taskCalls(host), [["tasks.cancel", agentId], ["tasks.remove", agentId]]);
+    assert.deepEqual(hookResults, [undefined, undefined]);
+    assert.equal(host.tasks.size, 0);
+});
+
+test("a stop that cancels the screener while its task list is in flight still delivers the reply", async (t) => {
+    const host = await bootScreening(t);
+    const list = host.session.rpc.tasks.list;
+    let agentId;
+    host.onStartAgent = (id) => { agentId = id; };
+    host.session.rpc.tasks.list = async () => {
+        if (agentId && host.tasks.get(agentId)?.status === "running") {
+            await host.stopSubagent(agentId, rejectingVerdict("raced reply"));
+        }
+        return list();
+    };
+    await host.command("learn-now");
+    assert.match(host.logs.at(-1), /failed: surprising \(raced reply\)/);
+    assert.deepEqual(taskCalls(host), [["tasks.cancel", agentId], ["tasks.remove", agentId]]);
+});
+
+test("without a stop hook a settled screener's reply is polled and its task left readable", async (t) => {
+    const host = await bootScreening(t);
+    host.onStartAgent = (agentId) => Object.assign(host.tasks.get(agentId), {
+        status: "idle", latestResponse: rejectingVerdict("polled reply"),
+    });
+    await host.command("learn-now");
+    assert.match(host.logs.at(-1), /failed: surprising \(polled reply\)/);
+    const agentId = startedAgent(host);
+    assert.deepEqual(taskCalls(host), [["tasks.cancel", agentId]]);
+    assert.equal(host.tasks.get(agentId).status, "idle");
+});
+
+test("without a stop hook or task reply, the event log is read by the owned task id", async (t) => {
+    const host = await bootScreening(t);
+    host.onStartAgent = (agentId) => {
+        host.events.push({ type: "subagent.started", agentId, data: { toolCallId: agentId } });
+        host.events.push({ type: "assistant.message", agentId: "someone-elses-agent", data: { content: rejectingVerdict("stranger reply") } });
+        host.events.push({ type: "assistant.message", agentId, data: { content: rejectingVerdict("event reply") } });
+        host.events.push({ type: "subagent.completed", agentId, data: {} });
+        host.tasks.get(agentId).status = "completed";
+    };
+    await host.command("learn-now");
+    assert.match(host.logs.at(-1), /failed: surprising \(event reply\)/);
+});
+
 test("declined and unavailable control confirmations do not change settings", async (t) => {
     const host = await boot(t);
     host.confirmationResult = false;

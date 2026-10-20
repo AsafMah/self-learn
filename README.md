@@ -360,8 +360,10 @@ additional model calls.
 These are standalone SDK measurements, **not** app-canvas/notification results or a migration of
 production `tasks.startAgent`. That task API does not acquire schema or reasoning-effort fields
 from this experiment. Approval, evidence validation and reviewer policy remain unchanged.
-Background-RPC hook delivery, multi-child races, in-flight tool replacement and attributed
-immediate steering need separate evidence before adoption.
+Hook delivery for RPC-started background agents was measured separately and adopted (see
+[Cancelling the screener](#cancelling-the-screener-to-keep-it-out-of-the-main-agents-context)).
+Multi-child races, in-flight tool replacement and attributed immediate steering still need separate
+evidence before adoption.
 
 ### What the tests are worth, measured
 
@@ -393,7 +395,9 @@ tallied, and nine were real gaps, now closed:
 The tenth is an equivalent mutant: removing the `id === ""` check in `isMainAgentStop` changes no
 behaviour, because the only case where it could decide anything requires an empty main session id,
 which the next line already refuses. Confirmed against 126 input pairs rather than argued.
-The second pass catches **41 of 42**, the exception being that mutant.
+The second pass catches **41 of 42**, the exception being that mutant. Two of those 42 targeted the
+reply recognisers that the `onSubagentStop` hook later made unnecessary, and were removed along with
+that code.
 
 Two things make this measurement lie, and both look exactly like success:
 
@@ -550,12 +554,15 @@ Nothing here is meant to run for a subtask — the screener reads only main-agen
 the main agent has the context to draft a skill from its own reasoning — so sub-agent calls are
 refused outright.
 
-`ToolInvocation` carries no agent identity (only `sessionId`, `toolCallId`, `toolName`,
-`arguments`), so the caller is resolved through the event log instead: `tool.execution_start` and
-`external_tool.requested` carry an `agentId` that is present for sub-agents and absent for the main
-agent, alongside a `toolCallId` that matches the invocation's.
+The caller is identified from `ToolInvocation.agentId`, which the SDK sets to the calling
+sub-agent's id and leaves empty for the main agent. Measured in an isolated probe (CLI 1.0.99-2):
+a `task`-tool child's call carried its `agentId`, and the main agent's carried `null`. An empty
+value is not treated as proof of the main agent, because a runtime may not populate the field, so
+the event log remains the fallback: `tool.execution_start` and `external_tool.requested` carry an
+`agentId` that is present for sub-agents and absent for the main agent, alongside a `toolCallId`
+that matches the invocation's.
 
-*The ordering is the trap.* The SDK invokes a tool handler from inside its own dispatch of
+*The fallback's ordering is the trap.* The SDK invokes a tool handler from inside its own dispatch of
 `external_tool.requested`, synchronously **before** that event reaches the extension's listeners,
 so a naive lookup always misses. Awaiting a single `setTimeout(…, 0)` lets the listener record the
 call first, which makes the check ordered rather than racy. Verified with a throwaway
@@ -644,8 +651,8 @@ agentDescription="A constructive critic for proposals, designs, …"
 So `model` is the only discriminator available in the event log, which is not enough: the advisor
 extension, this extension, and the main agent's own sub-agents all emit the same events. Matching
 "the first sub-agent started after my baseline" can silently claim another consumer's reply. The
-event-log path is retained only as a fallback and now requires a positive model match rather than
-guessing.
+event-log path is retained only as a last fallback, and matches nothing but the task id this
+extension started.
 
 ## The review hang (CLI regression, worked around)
 
@@ -884,51 +891,46 @@ if (s.status === "cancelled") { ...; return }              // ← no notificatio
 if (s.factoryRunId === void 0 && !s.activeBlockingReads) { sendBackgroundAgentCompletionNotification(s) }
 ```
 
-`factoryRunId` and `activeBlockingReads` are CLI-internal. Cancellation is not. So the screener is
-now cancelled the moment its verdict is parseable, rather than being left to finish and announce
-itself. Across 61 recorded runs the verdict message precedes `subagent.completed` by 1.6–4.8 s
-(median ~2.0 s), so the window is comfortable rather than a race worth being clever about.
+`factoryRunId` and `activeBlockingReads` are CLI-internal. Cancellation is not, so each screener
+and drafter is cancelled once its reply is in hand, rather than being left to finish and announce
+itself.
 
-**Every sub-agent needs its own recogniser, and forgetting that reintroduces the bug.** Cancelling
-early depends on noticing that the reply has arrived, and "has it arrived" is a question about the
-*shape* of the message. The recogniser was originally hard-coded to the verdict shape. When the
-drafter was added it inherited none of the suppression: its reply is a draft, not a verdict, so it
-was never recognised, never cancelled, and ran to completion — at which point the CLI announced
-"Agent self-learn-1 has finished" to the main agent, which then called `read_agent` and got nothing.
-Observed live at 08:57:33, one turn after the drafter shipped. `runScreener` now takes a `recognise`
-predicate (`looksLikeVerdict` or `looksLikeDraft`), so a new sub-agent cannot silently opt out of
-suppression by having a different reply shape.
+**The reply and the moment to cancel both come from `onSubagentStop`.** The SDK calls this hook
+when a sub-agent ends its turn, with that agent's `agentId` and final `response`, and awaits it
+before the CLI moves on. The extension records each task id `tasks.startAgent` returns, ignores
+stops for any other id, and for its own:
 
-**Identity is the hard part, and cost two failed runs.** There are two id namespaces:
-`startAgent` returns a *task* id derived from `name` (`self-learn-1`), while the event log tags the
-same agent `bg-<uuid>`. They are never equal, and `cancel`/`remove` accept only the former.
-Correlation therefore has to come from the events, and `subagent.started` turned out to carry the
-agent **type's** metadata, not ours:
+1. hands the response to the waiting `runScreener` *before* awaiting anything, so the poll loop
+   never observes the resulting `cancelled` status without the reply;
+2. awaits `tasks.cancel` for exactly that id, inside the hook;
+3. returns `undefined`, leaving the response unmodified.
 
-```
-agentName        = explore
-agentDisplayName = Explore Agent
-agentDescription = Fast codebase exploration and answering questions...
-```
+Measured in an isolated probe (CLI 1.0.99-2, separate `COPILOT_HOME`, three runs): the hook's
+`agentId` equalled the id `startAgent` returned and the `subagent.started` event's id; `response`
+was the agent's final reply; a cancel awaited inside the hook returned `{cancelled: true}`, the task
+was then removable, and no completion notification reached the main agent. In the control run
+without the cancel, an `agent_idle` notification fired and the main agent called `read_agent`.
+The child's own `onAgentStop` fires about 5 ms before `onSubagentStop`, which is why
+`isMainAgentStop` must still filter it.
 
-The `description` passed to `startAgent` appears nowhere in the event, so matching on
-`"Self-learn screening"` could never have worked. (The same dead match exists in
-`readReplyFromEventLog`, which has always fallen through to its model check.) What remains —
-`agentName` and `model` — is shared with the main agent's own `explore` sub-agents, and latching
-onto a stranger would cancel our screener early and read someone else's message as the verdict.
+**This replaced recognising the reply in the event stream.** The previous design watched
+`assistant.message` events and cancelled the moment a message had the expected shape. It needed a
+recogniser per reply shape — the drafter shipped without one, ran to completion and was announced
+to the main agent — and it needed identity, which it could only get by matching the sub-agent's
+first `user.message` against the head of the prompt just sent, because older runtimes named the
+task `self-learn-1` and the event-stream agent `bg-<uuid>`. The hook supplies identity and reply
+directly, so neither the recognisers nor the prompt match remain.
 
-The prompt is the one field only this extension could have produced, so identity comes from the
-sub-agent's first `user.message` matching the head of the prompt just sent.
+**Runtimes without the hook still get their reply, but not the suppression.** If the hook never
+fires, `runScreener` polls the task: `latestResponse` first, then the event log keyed by the task
+id. The event-log fallback finds nothing on a runtime whose event ids differ from task ids; there,
+`latestResponse` is what answers. Nothing cancels such a task before it finishes, so each screening
+there costs one completion notification.
 
 **Losing the race must stay harmless.** If completion wins, cancelling returns `{cancelled: false}`
 and removal is skipped, because removal is exactly what invalidated the notification's attached
 read in the first place. A lost race degrades to the old behaviour — one stray notification — not
 to an error.
-
-Verified live: `screener event id bg-ad286f0f-… (task id self-learn-1)` followed by `screener
-cancelled on verdict (notification suppressed)`, and no completion notification reached the main
-agent on that turn.
-
 ## Known limitations
 
 - **Contention with `advisor`.** `session.idle` is deferred while background work is pending. An

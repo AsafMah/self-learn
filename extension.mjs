@@ -23,8 +23,6 @@ import {
     MIN_QUOTE_CHARS,
     sanitize,
     parseVerdict,
-    looksLikeVerdict,
-    looksLikeDraft,
     referencedSkillNames,
     validateProposal,
     renderSkillFile,
@@ -164,11 +162,14 @@ function noteSubAgentToolCall(event) {
     }
 }
 
-// `ToolInvocation` carries no agent identity, so the caller is resolved through the event log.
-// The SDK invokes a tool handler from inside its own dispatch of `external_tool.requested`,
-// synchronously *before* that event reaches the extension's listeners; yielding once lets the
-// listener record the call first, which makes the lookup ordered rather than racy.
+// The SDK puts the calling agent's id on `ToolInvocation.agentId` for a sub-agent's call and leaves
+// it empty for the main agent's, so a present id is a positive signal. An absent one is not proof
+// of the main agent — a runtime may not populate it — so the event log is the fallback. The SDK
+// invokes a tool handler from inside its own dispatch of `external_tool.requested`, synchronously
+// *before* that event reaches the extension's listeners; yielding once lets the listener record
+// the call first, which makes the lookup ordered rather than racy.
 async function isSubAgentCall(invocation) {
+    if (invocation?.agentId) return true;
     const id = invocation?.toolCallId;
     if (!id) return false;
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -558,47 +559,49 @@ ${cfg("instructions") ? `\n\nAdditional instructions:\n${cfg("instructions")}` :
 // Screener output eventually reaches the main agent's context and is treated as untrusted; the
 // JSON extraction, verdict parsing and sanitizer all live in lib.mjs, where they are tested.
 
-// Mirrors the advisor's recovery path: `tasks.list()` never populates `result` for a sub-agent
-// that parks in "idle", and the reported toolCallId is a stub for RPC-started agents, so the
-// reply is correlated through `subagent.started` after a pre-recorded event baseline.
+// Screener replies arrive through the SDK's `onSubagentStop` hook, which fires once a sub-agent
+// finishes its turn and carries that agent's id and final response. Only ids this extension
+// started are claimed, so another extension's or the main agent's sub-agent is never mistaken for
+// the screener.
 //
-// The screener is cancelled the moment its verdict arrives rather than left to settle, because
-// the CLI notifies the MAIN agent whenever a background agent completes or goes idle — telling it
-// to `read_agent` a task this extension owns and is about to remove, which surfaced to the user as
-// "read self learn agent failed". The task registry's completion callback returns early for a
-// cancelled task, so cancelling first suppresses the notification at its source. There is no
-// option on `tasks.startAgent` to opt out.
+// The task is cancelled inside the hook, which the SDK awaits, because the CLI otherwise notifies
+// the MAIN agent that a background agent finished — telling it to `read_agent` a task this
+// extension owns and is about to remove, which surfaced to the user as "read self learn agent
+// failed". There is no option on `tasks.startAgent` to opt out. A cancel the hook loses costs only
+// that notification: the task is then left readable, and the reply is already in hand.
 //
-// The window is wide: across 61 recorded runs the verdict message preceded `subagent.completed`
-// by 1.6-4.8s (median ~2.0s), and this cancels within milliseconds of an event already delivered
-// live. Losing the race costs only the notification, since the polling path below still returns
-// the same reply.
-let screenerWatch = null;
+// A runtime that never calls the hook falls back to polling the task (`latestResponse`, then the
+// event log), which still returns the reply but cannot suppress the notification.
+const ownedAgents = new Map();
 
-function noteScreenerPrompt(event) {
-    const watch = screenerWatch;
-    if (!watch || watch.eventAgentId || !event?.agentId) return;
-    const content = event?.data?.content;
-    if (typeof content !== "string" || !content.startsWith(watch.promptHead)) return;
+async function onSubagentStop(input) {
+    const owner = ownedAgents.get(input?.agentId);
+    if (!owner) return undefined;
+    ownedAgents.delete(input.agentId);
 
-    watch.eventAgentId = event.agentId;
-    debug(`screener event id ${event.agentId} (task id ${watch.agentId ?? "pending"})`);
+    const response = typeof input.response === "string" ? input.response : "";
+    let cancel;
+    try {
+        cancel = Promise.resolve(owner.rpc.tasks.cancel({ id: input.agentId })).then(
+            (result) => result?.cancelled === true,
+            () => false,
+        );
+    } catch {
+        cancel = Promise.resolve(false);
+    }
+    // Handed over before awaiting anything: the poll loop must never see the "cancelled" status
+    // this produces without the reply that came with it.
+    owner.settle({ response, cancel });
+
+    debug(
+        (await cancel)
+            ? `${owner.label} ${input.agentId} cancelled at stop (notification suppressed)`
+            : `${owner.label} ${input.agentId} settled before cancel — notification will fire`,
+    );
+    return undefined;
 }
 
-function noteScreenerMessage(event) {
-    const watch = screenerWatch;
-    if (!watch || !watch.agentId || !event?.agentId) return;
-    if (event.agentId !== watch.eventAgentId) return;
-    const content = event?.data?.content;
-    // Which shape counts as "finished" depends on what this sub-agent was asked for. Hard-coding
-    // the verdict shape here meant the drafter was never recognised, so it ran to completion and
-    // the CLI announced it to the main agent — the exact noise the early cancel exists to prevent.
-    if (!watch.recognise(content)) return;
-    screenerWatch = null;
-    watch.onVerdict(content);
-}
-
-async function runScreener(session, prompt, { recognise = looksLikeVerdict, label = "screener" } = {}) {
+async function runScreener(session, prompt, { label = "screener" } = {}) {
     const rpc = session.rpc;
     if (!rpc?.tasks?.startAgent) throw new Error("session.rpc.tasks.startAgent unavailable");
 
@@ -609,53 +612,28 @@ async function runScreener(session, prompt, { recognise = looksLikeVerdict, labe
         baseline = 0;
     }
 
-    let earlyReply = null;
-    let cancelledEarly = false;
-    let signalEarly;
-    const earlyVerdict = new Promise((resolve) => {
-        signalEarly = resolve;
+    const model = cfg("screenerModel");
+    const { agentId } = await rpc.tasks.startAgent({
+        agentType: cfg("agentType"),
+        prompt,
+        name: "self-learn",
+        description: SCREENER_DESCRIPTION,
+        model,
     });
 
-    const watch = {
-        agentId: null,
-        eventAgentId: null,
-        promptHead: prompt.slice(0, 160),
-        recognise,
-        onVerdict: (content) => {
-            earlyReply = content;
-            // Cancel before awaiting anything, so the agent cannot settle in the gap.
-            rpc.tasks
-                .cancel({ id: watch.agentId })
-                .then((result) => {
-                    cancelledEarly = result?.cancelled === true;
-                    debug(
-                        cancelledEarly
-                            ? `${label} cancelled on reply (notification suppressed)`
-                            : `${label} settled before cancel — notification will fire`,
-                    );
-                })
-                .catch((err) => debug(`cancel-on-reply failed: ${err?.message ?? err}`))
-                .finally(signalEarly);
+    let stopResult = null;
+    let signalStop;
+    const stopped = new Promise((resolve) => {
+        signalStop = resolve;
+    });
+    ownedAgents.set(agentId, {
+        label,
+        rpc,
+        settle: (result) => {
+            stopResult = result;
+            signalStop();
         },
-    };
-    // Installed first: `subagent.started` can otherwise land before the id comes back.
-    screenerWatch = watch;
-
-    let agentId;
-    const model = cfg("screenerModel");
-    try {
-        ({ agentId } = await rpc.tasks.startAgent({
-            agentType: cfg("agentType"),
-            prompt,
-            name: "self-learn",
-            description: SCREENER_DESCRIPTION,
-            model,
-        }));
-    } catch (err) {
-        screenerWatch = null;
-        throw err;
-    }
-    watch.agentId = agentId;
+    });
     debug(`${label} ${agentId} started on ${model} (baseline ${baseline})`);
 
     const deadline = Date.now() + cfg("timeoutMs");
@@ -664,11 +642,8 @@ async function runScreener(session, prompt, { recognise = looksLikeVerdict, labe
 
     try {
         while (Date.now() < deadline) {
-            await Promise.race([
-                earlyVerdict,
-                new Promise((r) => setTimeout(r, cfg("pollIntervalMs"))),
-            ]);
-            if (earlyReply) return earlyReply;
+            await Promise.race([stopped, new Promise((r) => setTimeout(r, cfg("pollIntervalMs")))]);
+            if (stopResult) return stopResult.response;
 
             let tasks = [];
             try {
@@ -676,6 +651,8 @@ async function runScreener(session, prompt, { recognise = looksLikeVerdict, labe
             } catch (err) {
                 throw new Error(`tasks.list failed: ${err?.message ?? err}`);
             }
+            // The hook may have fired, and cancelled the task, while the list was in flight.
+            if (stopResult) return stopResult.response;
 
             const task = tasks.find((t) => t.id === agentId);
             if (!task) {
@@ -685,64 +662,53 @@ async function runScreener(session, prompt, { recognise = looksLikeVerdict, labe
             seen = true;
 
             if (task.status === "failed") throw new Error(task.error || "screener failed");
-            if (task.status === "cancelled") return earlyReply ?? "";
+            if (task.status === "cancelled") return "";
 
             // Exact correlation: these are keyed by the task id we own, so unlike event-log
             // matching they cannot pick up another extension's or the main agent's sub-agent.
             if (task.result) {
-                debug(`reply via task.result`);
+                debug(`reply via task.result (stop hook did not fire)`);
                 return task.result;
             }
             if (task.latestResponse) {
-                debug(`reply via task.latestResponse`);
+                debug(`reply via task.latestResponse (stop hook did not fire)`);
                 return task.latestResponse;
             }
 
-            const { status, reply } = await readReplyFromEventLog(session, baseline, watch.eventAgentId);
+            const { status, reply } = await readReplyFromEventLog(session, baseline, agentId);
+            if (stopResult) return stopResult.response;
             if (status === "failed") throw new Error(reply);
             if (status === "done") {
-                debug(`reply via event log (fallback)`);
+                debug(`reply via event log (stop hook did not fire)`);
                 return reply;
             }
 
             if (task.status === "completed" || task.status === "idle") {
                 if (++emptySettledPolls >= SETTLED_EMPTY_POLL_LIMIT) {
-                    debug(`screener ${agentId} settled with no reply`);
+                    debug(`${label} ${agentId} settled with no reply`);
                     return "";
                 }
             } else {
                 emptySettledPolls = 0;
             }
         }
-        throw new Error(`screener timed out after ${cfg("timeoutMs")}ms`);
+        throw new Error(`${label} timed out after ${cfg("timeoutMs")}ms`);
     } finally {
-        if (screenerWatch === watch) {
-            // Two failed live runs were each diagnosed only after the fact. If identity was never
-            // resolved, record which sub-agent events actually arrived, so the next failure is
-            // self-explanatory instead of costing another run.
-            if (!watch.eventAgentId) {
-                const sub = [...deliveredTypes.keys()].filter((k) => k.endsWith("@sub"));
-                debug(`screener never identified in the event stream; sub-agent types seen: ${sub.join(", ") || "none"}`);
-            }
-            screenerWatch = null;
-        }
-        await disposeTask(rpc, agentId, cancelledEarly);
+        ownedAgents.delete(agentId);
+        await disposeTask(rpc, agentId, stopResult ? await stopResult.cancel : false);
     }
 }
 
-// Correlated by the event-stream agent id the watch resolved from the prompt prefix, which is the
-// only key here that has ever worked. Two earlier keys were wrong: `data.agentDescription` is the
-// agent *type's* blurb rather than the per-call description, so matching it against our own
-// description scored 0 across 1357 `subagent.started` events on this machine; and falling back to
-// `data.model` would happily claim the advisor extension's sub-agent whenever it ran the same
-// model, which is precisely the silent cross-wiring this must avoid. The task id cannot be used
-// either — it is a name like `self-learn-1`, while the event stream uses `bg-<uuid>`.
+// Keyed by the task id `tasks.startAgent` returned, which the event stream also uses as the
+// sub-agent's `agentId` on runtimes that have the stop hook. A runtime that names the two
+// differently finds nothing here, leaving `latestResponse` as its fallback. Matching by anything
+// looser is ruled out: `data.agentDescription` is the agent *type's* blurb rather than the
+// per-call description, and `data.model` would claim the advisor extension's sub-agent whenever
+// it ran the same model — precisely the silent cross-wiring this must avoid.
 //
-// Waiting for `subagent.completed` is deliberate here: this is the fallback for when the watch
-// never fired, so an earlier `assistant.message` could still be an intermediate one. Cancellation
-// (and with it notification suppression) is the watch's job, not this function's.
+// Waiting for `subagent.completed` is deliberate: an earlier `assistant.message` could still be an
+// intermediate one.
 async function readReplyFromEventLog(session, baseline, eventAgentId) {
-    // Identity not resolved yet — keep waiting rather than guess at a stranger's sub-agent.
     if (!eventAgentId) return { status: "pending", reply: "" };
 
     let events = [];
@@ -1086,10 +1052,7 @@ async function draft(session, verdict, transcript) {
     let prompt = buildDrafterPrompt(verdict, transcript, existing);
 
     for (let attempt = 1; attempt <= DRAFT_ATTEMPTS; attempt++) {
-        const raw = await runScreener(session, prompt, {
-            recognise: looksLikeDraft,
-            label: "drafter",
-        });
+        const raw = await runScreener(session, prompt, { label: "drafter" });
         const result = parseDraft(raw, verdict);
 
         if (result.decline) return result;
@@ -1914,6 +1877,8 @@ const session = await joinSession({
             }
         },
 
+        // Claims the stop of a screener or drafter this extension started, and ignores all others.
+        onSubagentStop,
     },
 
     commands: [
@@ -2022,11 +1987,7 @@ session.on((event) => {
     const key = `${event?.type}${event?.agentId ? "@sub" : ""}`;
     deliveredTypes.set(key, (deliveredTypes.get(key) ?? 0) + 1);
     if (event?.type === "external_tool.requested") noteSubAgentToolCall(event);
-    if (event?.type === "user.message") {
-        noteScreenerPrompt(event);
-        handleUserMessage(event);
-    }
-    if (event?.type === "assistant.message") noteScreenerMessage(event);
+    if (event?.type === "user.message") handleUserMessage(event);
     if (event?.type === "tool.execution_start") {
         noteSubAgentToolCall(event);
         countToolCall(event);

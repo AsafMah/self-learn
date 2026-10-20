@@ -67,10 +67,6 @@ const M = [
   ["append-trim", "body not trimmed before append", "const body = parts.body.trim();", "const body = parts.body;"],
   ["frontmatter-greedy", "frontmatter regex greedy", "const match = /^---\\r?\\n([\\s\\S]*?)\\r?\\n---\\r?\\n?/.exec(text);", "const match = /^---\\r?\\n([\\s\\S]*)\\r?\\n---\\r?\\n?/.exec(text);"],
 
-  // --- sub-agent recognisers ---
-  ["draft-empty-body", "empty body counts as a finished draft", 'if (typeof obj.body === "string" && obj.body.trim()) return true;', 'if (typeof obj.body === "string") return true;'],
-  ["verdict-any-object", "any JSON object counts as a verdict", 'if (obj && typeof obj === "object" && obj.criteria) return true;', 'if (obj && typeof obj === "object") return true;'],
-
   // --- main-agent stop guard ---
   ["stop-prefix", "bg- prefix test instead of equality", "return id === mainSessionId;", 'return !id.startsWith("bg-");'],
   ["stop-empty-id", "empty session id accepted", 'if (typeof id !== "string" || id === "") return false;', 'if (typeof id !== "string") return false;'],
