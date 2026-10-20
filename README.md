@@ -254,6 +254,11 @@ reviewing or committing would mark them.
 - Any existing `SKILL.md` is copied to `SKILL.md.bak` before being replaced — keyed on the file
   existing, not on the declared mode, so a `new` proposal colliding with an existing skill is
   still recoverable and is labelled as an overwrite. Supporting files are backed up the same way.
+  A retry after a partly failed write keeps the original backup: each file the draft writes is
+  recorded by content hash (and saved with the pending proposal), so a file still holding the
+  draft's own earlier attempt is not backed up again, and an `extend` is rebuilt from the original
+  in `SKILL.md.bak` instead of appending a second time. A file edited by hand since that attempt
+  no longer matches and is backed up as usual.
 - The approval dialog shows the exact file to be written.
 - The user's hand-written `~/.copilot/copilot-instructions.md` is never touched.
 - Refining a skill that is **disabled** in settings is detected and surfaced in the approval

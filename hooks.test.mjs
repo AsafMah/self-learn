@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { boot } from "./test-support/host.mjs";
 
@@ -536,6 +536,84 @@ test("a late Yes whose write fails leaves the newer dialog to decide", async (t)
     assert.equal(await settles(second), "returned");
     assert.equal(statusOf(host).written, 1);
     assert.ok(existsSync(file));
+});
+
+// A directory where a supporting file belongs makes the write fail after SKILL.md is written.
+function blockSupportingFile(host, name) {
+    const blocker = join(dirname(lessonFile(host, name)), "check.ps1");
+    mkdirSync(blocker, { recursive: true });
+    return () => rmSync(blocker, { recursive: true });
+}
+
+const WITH_FILE = { files: [{ path: "check.ps1", content: "Write-Output 'check'" }] };
+const ORIGINAL_SKILL = "---\nname: test-lesson\ndescription: Hand-written\n---\n\nORIGINAL HAND-WRITTEN SKILL\n";
+
+test("retrying a partly failed write keeps the original in SKILL.md.bak", async (t) => {
+    const host = await boot(t, { pendingProposal: { ...PENDING_LESSON, ...WITH_FILE } });
+    const file = lessonFile(host, "test-lesson");
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, ORIGINAL_SKILL);
+    const unblock = blockSupportingFile(host, "test-lesson");
+
+    await mainStop(host);
+    assert.match(statusOf(host).lastError ?? "", /write failed/);
+    assert.equal(readFileSync(`${file}.bak`, "utf8"), ORIGINAL_SKILL);
+    assert.equal(typeof savedProposal(host).writes?.["SKILL.md"], "string", "a reload would still recognise the first attempt");
+
+    unblock();
+    await mainStop(host);
+    assert.equal(statusOf(host).written, 1);
+    assert.equal(readFileSync(`${file}.bak`, "utf8"), ORIGINAL_SKILL, "the retry did not back up its own first attempt");
+    assert.ok(existsSync(join(dirname(file), "check.ps1")));
+});
+
+test("retrying a partly failed write of a new skill leaves no backup of the first attempt", async (t) => {
+    const host = await boot(t, { pendingProposal: { ...PENDING_LESSON, ...WITH_FILE } });
+    const file = lessonFile(host, "test-lesson");
+    const unblock = blockSupportingFile(host, "test-lesson");
+    await mainStop(host);
+    assert.match(statusOf(host).lastError ?? "", /write failed/);
+    unblock();
+    await mainStop(host);
+    assert.equal(statusOf(host).written, 1);
+    assert.equal(existsSync(`${file}.bak`), false);
+});
+
+test("retrying a partly failed extend appends the section once and keeps the original in the backup", async (t) => {
+    const host = await boot(t, { pendingProposal: {
+        mode: "extend", name: "my-guide", section: "Lockfile cache keys",
+        description: "When a restored dependency cache looks stale",
+        body: "Key the cache on the lockfile hash.", why: "Fixture evidence", ...WITH_FILE,
+    } });
+    const skill = installSkill(host, "my-guide", "personal-agents", AGENTS_SKILLS);
+    const original = readFileSync(skill.path, "utf8");
+    const unblock = blockSupportingFile(host, "my-guide");
+
+    await mainStop(host);
+    assert.match(statusOf(host).lastError ?? "", /write failed/);
+    unblock();
+    await mainStop(host);
+
+    assert.equal(statusOf(host).written, 1, statusOf(host).lastError);
+    const text = readFileSync(skill.path, "utf8");
+    assert.equal(text.match(/^#+ Lockfile cache keys$/gm)?.length, 1);
+    assert.match(text, /Existing my-guide guidance\./);
+    assert.equal(readFileSync(`${skill.path}.bak`, "utf8"), original);
+    assert.ok(existsSync(join(dirname(skill.path), "check.ps1")));
+});
+
+test("a skill edited by hand between write attempts is backed up again", async (t) => {
+    const host = await boot(t, { pendingProposal: { ...PENDING_LESSON, ...WITH_FILE } });
+    const file = lessonFile(host, "test-lesson");
+    const unblock = blockSupportingFile(host, "test-lesson");
+    await mainStop(host);
+    assert.match(statusOf(host).lastError ?? "", /write failed/);
+
+    writeFileSync(file, ORIGINAL_SKILL);
+    unblock();
+    await mainStop(host);
+    assert.equal(statusOf(host).written, 1);
+    assert.equal(readFileSync(`${file}.bak`, "utf8"), ORIGINAL_SKILL);
 });
 
 test("declined and unavailable control confirmations do not change settings", async (t) => {

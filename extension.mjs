@@ -16,7 +16,9 @@ import {
     mkdirSync,
     copyFileSync,
     rmSync,
+    statSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join, dirname, resolve, sep } from "node:path";
 import {
@@ -908,19 +910,39 @@ async function resolveSkillFile(session, name, { mode = "new" } = {}) {
     return { dir, file: join(dir, "SKILL.md") };
 }
 
+const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+
 async function writeSkill(session, p) {
     const { dir, file } = await resolveSkillFile(session, p.name, { mode: p.mode });
     const existed = existsSync(file);
 
+    // What this draft has already written, by path relative to the skill directory. A retry after a
+    // partly failed write must not back up its own first attempt over the original in .bak, and an
+    // extend must not append to it. Matched on content, so a file edited by hand since then is
+    // treated as the user's again.
+    const writes = (p.writes ??= {});
+    const ours = (target, key) =>
+        typeof writes[key] === "string" && existsSync(target) && statSync(target).isFile() &&
+        writes[key] === sha256(readFileSync(target));
+    const write = (target, key, text) => {
+        writeFileSync(target, text, "utf8");
+        writes[key] = sha256(Buffer.from(text, "utf8"));
+    };
+
     // Keyed on existence, not on the declared mode: a proposal claiming mode "new" whose name
     // collides with an existing skill would otherwise destroy a hand-written file with no backup.
-    const backup = (target) => {
+    const backup = (target, key) => {
         if (!existsSync(target)) return;
+        if (ours(target, key)) {
+            debug(`kept ${target}.bak: ${target} is this draft's own earlier attempt`);
+            return;
+        }
         copyFileSync(target, `${target}.bak`);
         debug(`backed up ${target} -> ${target}.bak`);
     };
 
-    backup(file);
+    const retrying = ours(file, "SKILL.md");
+    backup(file, "SKILL.md");
     mkdirSync(dir, { recursive: true });
 
     let content;
@@ -928,7 +950,9 @@ async function writeSkill(session, p) {
         if (!existed) {
             throw new Error(`"${p.name}" does not exist, so there is nothing to extend.`);
         }
-        content = appendSection(readFileSync(file, "utf8"), p);
+        // On a retry SKILL.md already holds this section, so extend the original kept in .bak.
+        const base = retrying ? `${file}.bak` : file;
+        content = appendSection(readFileSync(base, "utf8"), p);
         // Checked against the assembled file rather than the new section alone: the point of the
         // cap is what a future session pays to load the skill, and an umbrella only ever grows.
         const size = Buffer.byteLength(content, "utf8");
@@ -942,7 +966,7 @@ async function writeSkill(session, p) {
         content = renderSkillFile(p);
     }
 
-    writeFileSync(file, content, "utf8");
+    write(file, "SKILL.md", content);
     debug(`wrote ${file} (mode=${p.mode}, existed=${existed})`);
 
     const dirWithSep = dir.endsWith(sep) ? dir : dir + sep;
@@ -953,9 +977,9 @@ async function writeSkill(session, p) {
         if (!target.startsWith(dirWithSep)) {
             throw new Error(`refusing to write outside the skill directory: ${target}`);
         }
-        backup(target);
+        backup(target, f.path);
         mkdirSync(dirname(target), { recursive: true });
-        writeFileSync(target, f.content, "utf8");
+        write(target, f.path, f.content);
         debug(`wrote ${target} (${Buffer.byteLength(f.content, "utf8")} bytes)`);
     }
 
@@ -1452,6 +1476,8 @@ async function writeApproved(session, p) {
         return "written";
     } catch (err) {
         approvedOnce.delete(p);
+        // Saves what the failed attempt already wrote (`p.writes`), so the retry recognises it.
+        if (state.pendingProposal === p) persistPendingProposal(session);
         // Kept so a transient failure (locked file, transient FS error) can be retried.
         state.lastError = `write failed: ${err?.message ?? err}`;
         debug(`${state.lastError} — proposal "${p.name}" retained for retry`);
