@@ -915,8 +915,10 @@ at the next stop. An unanswered dialog does not count towards the 3-attempt limi
 
 The old dialog can still be on screen and still be answered:
 
-- A late **Yes** writes the draft, provided it is still the pending one and no other approval
-  dialog is open — an open one decides instead.
+- A late **Yes** writes the draft if it is still the pending one, even while a newer dialog for
+  the same draft is open. That newer dialog then decides nothing: a Yes there does not write the
+  draft again, and a No there is not recorded as a decline. If the late write fails, the draft
+  stays pending and the newer dialog decides as usual.
 - A late **No** is ignored and the draft is kept. `confirm` returns `false` for a No and a
   dismissal alike, and recording a dismissal as a decline would suppress the lesson for good. The
   user declines at the next dialog instead.

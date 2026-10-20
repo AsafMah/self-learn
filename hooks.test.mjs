@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { boot } from "./test-support/host.mjs";
@@ -437,24 +437,105 @@ test("an approval timeout too long for a timer still waits instead of ending at 
     assert.equal(statusOf(host).written, 1);
 });
 
-test("a late Yes defers to an approval dialog open for the same draft", async (t) => {
-    // Long enough for the second dialog to still be open when the first is answered.
+// The first stop's dialog times out and the second stop offers the same draft again. The timeout is
+// long enough for that second dialog to still be open while the first is answered.
+async function twoDialogsForOneDraft(t) {
+    const host = await boot(t, { pendingProposal: PENDING_LESSON, config: { approvalTimeoutMs: 1000 } });
+    const answers = holdDialogs(host);
+    assert.equal(await settles(mainStop(host)), "returned");
+    const second = mainStop(host);
+    await until(() => answers.length === 2, "the second dialog");
+    return { host, answers, second };
+}
+
+test("a late Yes writes while a newer dialog for the same draft is open, and a No there changes nothing", async (t) => {
+    const { host, answers, second } = await twoDialogsForOneDraft(t);
+    answers[0](true);
+    await until(() => statusOf(host).written === 1, "the late approval to be written");
+    assert.ok(existsSync(lessonFile(host, "test-lesson")));
+    assert.equal(statusOf(host).pending, null);
+    assert.equal(statusOf(host).phase, "Approval in progress", "the open dialog keeps its own latch");
+
+    answers[1](false);
+    assert.equal(await settles(second), "returned");
+    assert.equal(statusOf(host).written, 1);
+    assert.equal(existsSync(declineLedger(host)), false, "a No after the write is not recorded as a decline");
+    assert.equal(statusOf(host).phase, "Idle");
+});
+
+for (const [when, answer] of [
+    ["after the late write", async (answers, host) => {
+        answers[0](true);
+        await until(() => statusOf(host).written === 1, "the late approval to be written");
+        answers[1](true);
+    }],
+    ["in the same tick, stale dialog first", async (answers) => { answers[0](true); answers[1](true); }],
+    ["in the same tick, newer dialog first", async (answers) => { answers[1](true); answers[0](true); }],
+]) {
+    test(`a Yes on both dialogs for one draft writes it once (${when})`, async (t) => {
+        const { host, answers, second } = await twoDialogsForOneDraft(t);
+        await answer(answers, host);
+        assert.equal(await settles(second), "returned");
+        await delay(20);
+        assert.equal(statusOf(host).written, 1);
+        assert.equal(existsSync(`${lessonFile(host, "test-lesson")}.bak`), false, "nothing wrote over the first write");
+        assert.equal(statusOf(host).pending, null);
+        assert.equal(existsSync(declineLedger(host)), false);
+    });
+}
+
+test("a Yes on two expired dialogs for one draft writes it once", async (t) => {
+    const host = await boot(t, { pendingProposal: PENDING_LESSON, config: { approvalTimeoutMs: 30 } });
+    const answers = holdDialogs(host);
+    assert.equal(await settles(mainStop(host)), "returned");
+    assert.equal(await settles(mainStop(host)), "returned");
+    assert.equal(answers.length, 2);
+
+    answers[0](true);
+    answers[1](true);
+    await until(() => statusOf(host).written === 1, "the late approval to be written");
+    await delay(20);
+    assert.equal(statusOf(host).written, 1);
+    assert.equal(existsSync(`${lessonFile(host, "test-lesson")}.bak`), false, "nothing wrote over the first write");
+    assert.equal(statusOf(host).phase, "Idle");
+});
+
+test("a late Yes landing before the newer dialog opens writes the draft and opens no dialog for it", async (t) => {
     const host = await boot(t, { pendingProposal: PENDING_LESSON, config: { approvalTimeoutMs: 1000 } });
     const answers = holdDialogs(host);
     assert.equal(await settles(mainStop(host)), "returned");
 
+    // Holds the second stop's skill-path lookup, which comes before its dialog.
+    const list = host.session.rpc.skills.list;
+    let release = null;
+    host.session.rpc.skills.list = () => release
+        ? list()
+        : new Promise((resolve) => { release = () => resolve(list()); });
     const second = mainStop(host);
-    await until(() => answers.length === 2, "the second dialog");
+    await until(() => release, "the second stop to look up the skill path");
     answers[0](true);
-    await delay(20);
-    assert.equal(statusOf(host).written, 0, "the open dialog decides, not the stale one");
-    assert.equal(statusOf(host).phase, "Approval in progress");
+    await until(() => statusOf(host).written === 1, "the late approval to be written");
 
-    answers[1](false);
-    await second;
-    assert.equal(statusOf(host).written, 0);
-    assert.equal(statusOf(host).pending, null);
-    assert.ok(existsSync(declineLedger(host)));
+    release();
+    assert.equal(await settles(second), "returned");
+    assert.equal(answers.length, 1, "no dialog is opened for a draft already written");
+    assert.equal(statusOf(host).written, 1);
+});
+
+test("a late Yes whose write fails leaves the newer dialog to decide", async (t) => {
+    const { host, answers, second } = await twoDialogsForOneDraft(t);
+    // A directory where SKILL.md belongs makes the write fail.
+    const file = lessonFile(host, "test-lesson");
+    mkdirSync(file, { recursive: true });
+    answers[0](true);
+    await until(() => /write failed/.test(statusOf(host).lastError ?? ""), "the late write to fail");
+    assert.equal(statusOf(host).pending?.name, "test-lesson");
+
+    rmSync(file, { recursive: true });
+    answers[1](true);
+    assert.equal(await settles(second), "returned");
+    assert.equal(statusOf(host).written, 1);
+    assert.ok(existsSync(file));
 });
 
 test("declined and unavailable control confirmations do not change settings", async (t) => {

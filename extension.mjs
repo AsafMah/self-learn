@@ -1239,6 +1239,13 @@ async function resolvePendingProposal(session, { signal } = {}) {
     persistPendingProposal(session);
 
     const discard = (reason) => discardProposal(session, p, reason);
+    // An earlier, expired dialog for this same draft was answered Yes, and that answer has written
+    // it or is writing it. The user chose that this dialog then decides nothing: no second write,
+    // and no decline recorded for a No.
+    const approvedLate = () => {
+        debug(`proposal "${p.name}": already approved on an expired dialog; nothing more to decide`);
+        return "written";
+    };
 
     try {
         // Label from what is actually on disk, not from the declared mode, so a "new" proposal
@@ -1326,6 +1333,10 @@ take effect until you re-enable it.`
 ${heading}${closeOpenFence(truncate(p.body, 800))}\
 ${filesNote}${backupNote}${pathNote}${disabledNote}\n\nWrite it?`;
 
+        // Checked before the dialog and again after it: the earlier dialog can be answered at any
+        // time, including while the path above was being looked up.
+        if (approvedOnce.has(p)) return approvedLate();
+
         let reply;
         try {
             reply = await awaitAnswer(session, message, signal);
@@ -1335,6 +1346,8 @@ ${filesNote}${backupNote}${pathNote}${disabledNote}\n\nWrite it?`;
             debug(`${state.lastError} — proposal "${p.name}" retained`);
             return "retained";
         }
+
+        if (approvedOnce.has(p)) return approvedLate();
 
         if (reply.ended) {
             // Not counted against the attempt limit: an unanswered dialog says nothing about the
@@ -1399,32 +1412,38 @@ async function awaitAnswer(session, message, signal) {
 }
 
 // An answer to a dialog whose wait already ended. A Yes is still the user's approval of exactly
-// this draft, so it is written while that draft is the pending one — unless another approval of
-// it is open, which then decides instead. Anything else is ignored and the draft is offered again
-// at the next stop: `confirm` reports a No and a dismissal alike as false, so a late false cannot
-// be told apart from the dialog simply being closed.
+// this draft, so it is written while that draft is the pending one — even when a newer dialog for
+// it is open, which then decides nothing (see `approvedOnce`). Anything else is ignored and the
+// draft is offered again at the next stop: `confirm` reports a No and a dismissal alike as false,
+// so a late false cannot be told apart from the dialog simply being closed.
 async function answeredLate(session, p, approved) {
     if (approved !== true) {
         debug(`proposal "${p.name}": late No or dismissal of an expired dialog ignored; kept`);
         return;
     }
-    if (state.pendingProposal !== p || state.resolvingProposal) {
-        const why = state.pendingProposal !== p ? "it is no longer pending" : "another approval is open";
+    if (state.pendingProposal !== p || approvedOnce.has(p)) {
+        const why = state.pendingProposal !== p ? "it is no longer pending" : "it is already being written";
         debug(`proposal "${p.name}": late approval ignored, ${why}`);
         return;
     }
-    state.resolvingProposal = true;
+    // The approval latch is left alone: it opens no dialog, and a held latch belongs to the newer
+    // dialog for this draft, which `approvedOnce` already stops from deciding again.
     try {
         debug(`proposal "${p.name}" approved late, on an expired dialog`);
         await writeApproved(session, p);
     } catch (err) {
         debug(`proposal "${p.name}": late approval failed: ${err?.message ?? err}`);
-    } finally {
-        state.resolvingProposal = false;
     }
 }
 
+// Drafts whose approved write is under way or done, so that two Yeses for one draft — a late one
+// and the newer dialog's — write it once. Claimed before the write's first await and released if
+// the write fails, so the draft can still be approved again. Kept in memory rather than on the
+// proposal: the proposal is persisted, and a reload mid-write would strand a persisted claim.
+const approvedOnce = new WeakSet();
+
 async function writeApproved(session, p) {
+    approvedOnce.add(p);
     try {
         const file = await writeSkill(session, p);
         discardProposal(session, p, "written");
@@ -1432,6 +1451,7 @@ async function writeApproved(session, p) {
         await say(`self-learn: wrote ${file}`);
         return "written";
     } catch (err) {
+        approvedOnce.delete(p);
         // Kept so a transient failure (locked file, transient FS error) can be retried.
         state.lastError = `write failed: ${err?.message ?? err}`;
         debug(`${state.lastError} — proposal "${p.name}" retained for retry`);
