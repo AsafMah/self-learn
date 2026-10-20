@@ -16,15 +16,15 @@ import {
     mkdirSync,
     copyFileSync,
     rmSync,
+    statSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join, dirname, resolve, sep } from "node:path";
 import {
     MIN_QUOTE_CHARS,
     sanitize,
     parseVerdict,
-    looksLikeVerdict,
-    looksLikeDraft,
     referencedSkillNames,
     validateProposal,
     renderSkillFile,
@@ -32,6 +32,8 @@ import {
     appendSection,
     parseDraft,
     isMainAgentStop,
+    personalSkillsRoot,
+    isInsideRoot,
 } from "./lib.mjs";
 
 const DEFAULTS = {
@@ -60,6 +62,10 @@ const DEFAULTS = {
     maxTranscriptChars: 120000,
     maxToolResultChars: 1200,
     timeoutMs: 180000,
+    // An approval dialog nobody answers must not hold the approval open forever. A tool call's
+    // wait ends when the host abandons the call; the stop hook has no such signal, so its wait
+    // ends after this long instead. 0 or null waits indefinitely.
+    approvalTimeoutMs: 30 * 60 * 1000,
     pollIntervalMs: 2000,
     logToTimeline: true,
     debugLog: join(homedir(), ".copilot", "logs", "self-learn.log"),
@@ -164,11 +170,14 @@ function noteSubAgentToolCall(event) {
     }
 }
 
-// `ToolInvocation` carries no agent identity, so the caller is resolved through the event log.
-// The SDK invokes a tool handler from inside its own dispatch of `external_tool.requested`,
-// synchronously *before* that event reaches the extension's listeners; yielding once lets the
-// listener record the call first, which makes the lookup ordered rather than racy.
+// The SDK puts the calling agent's id on `ToolInvocation.agentId` for a sub-agent's call and leaves
+// it empty for the main agent's, so a present id is a positive signal. An absent one is not proof
+// of the main agent — a runtime may not populate it — so the event log is the fallback. The SDK
+// invokes a tool handler from inside its own dispatch of `external_tool.requested`, synchronously
+// *before* that event reaches the extension's listeners; yielding once lets the listener record
+// the call first, which makes the lookup ordered rather than racy.
 async function isSubAgentCall(invocation) {
+    if (invocation?.agentId) return true;
     const id = invocation?.toolCallId;
     if (!id) return false;
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -420,10 +429,12 @@ async function listSkills(session) {
     try {
         const { skills } = await session.rpc.skills.list();
         const referenced = loadInstructionSkillNames(skills.map((s) => s.name));
+        const root = skillsRootFrom(skills);
         return skills.map((s) => ({
             name: s.name,
             description: s.description,
             referenced: referenced.has(s.name),
+            readOnly: !isInsideRoot(s.path, root),
         }));
     } catch (err) {
         debug(`skills.list failed: ${err?.message ?? err}`);
@@ -437,7 +448,8 @@ function buildScreenerPrompt(transcript, skills, declined = []) {
             ? skills
                   .map(
                       (s) =>
-                          `- ${s.name}${s.referenced ? " [IN USER'S INSTRUCTIONS]" : ""}: ${s.description ?? ""}`,
+                          `- ${s.name}${s.readOnly ? " [READ-ONLY]" : ""}` +
+                          `${s.referenced ? " [IN USER'S INSTRUCTIONS]" : ""}: ${s.description ?? ""}`,
                   )
                   .join("\n")
             : "(no skills installed)";
@@ -543,6 +555,10 @@ Respond with EXACTLY ONE JSON object and nothing else:
     since it rewrites the whole skill.
   - "new" — no skill above owns the subject. Give a short kebab-case name.
   Merely adjacent is not enough: mistargeting corrupts an unrelated skill.
+- Skills marked [READ-ONLY] are outside the skills directory this extension writes to — a
+  repository's, a plugin's, the runtime's, or another personal one — and cannot be changed
+  here. "extend" and "refine" are for unmarked skills only: a lesson in a read-only skill's subject
+  is "new", with its own name. This overrides the [IN USER'S INSTRUCTIONS] preference below.
 - Skills marked [IN USER'S INSTRUCTIONS] are named in the user's own instruction files, so the
   agent is told they exist in every session. Unmarked skills are surfaced only when the runtime
   judges them relevant, and a narrowly-scoped new skill is often never surfaced at all — measured
@@ -558,47 +574,49 @@ ${cfg("instructions") ? `\n\nAdditional instructions:\n${cfg("instructions")}` :
 // Screener output eventually reaches the main agent's context and is treated as untrusted; the
 // JSON extraction, verdict parsing and sanitizer all live in lib.mjs, where they are tested.
 
-// Mirrors the advisor's recovery path: `tasks.list()` never populates `result` for a sub-agent
-// that parks in "idle", and the reported toolCallId is a stub for RPC-started agents, so the
-// reply is correlated through `subagent.started` after a pre-recorded event baseline.
+// Screener replies arrive through the SDK's `onSubagentStop` hook, which fires once a sub-agent
+// finishes its turn and carries that agent's id and final response. Only ids this extension
+// started are claimed, so another extension's or the main agent's sub-agent is never mistaken for
+// the screener.
 //
-// The screener is cancelled the moment its verdict arrives rather than left to settle, because
-// the CLI notifies the MAIN agent whenever a background agent completes or goes idle — telling it
-// to `read_agent` a task this extension owns and is about to remove, which surfaced to the user as
-// "read self learn agent failed". The task registry's completion callback returns early for a
-// cancelled task, so cancelling first suppresses the notification at its source. There is no
-// option on `tasks.startAgent` to opt out.
+// The task is cancelled inside the hook, which the SDK awaits, because the CLI otherwise notifies
+// the MAIN agent that a background agent finished — telling it to `read_agent` a task this
+// extension owns and is about to remove, which surfaced to the user as "read self learn agent
+// failed". There is no option on `tasks.startAgent` to opt out. A cancel the hook loses costs only
+// that notification: the task is then left readable, and the reply is already in hand.
 //
-// The window is wide: across 61 recorded runs the verdict message preceded `subagent.completed`
-// by 1.6-4.8s (median ~2.0s), and this cancels within milliseconds of an event already delivered
-// live. Losing the race costs only the notification, since the polling path below still returns
-// the same reply.
-let screenerWatch = null;
+// A runtime that never calls the hook falls back to polling the task (`latestResponse`, then the
+// event log), which still returns the reply but cannot suppress the notification.
+const ownedAgents = new Map();
 
-function noteScreenerPrompt(event) {
-    const watch = screenerWatch;
-    if (!watch || watch.eventAgentId || !event?.agentId) return;
-    const content = event?.data?.content;
-    if (typeof content !== "string" || !content.startsWith(watch.promptHead)) return;
+async function onSubagentStop(input) {
+    const owner = ownedAgents.get(input?.agentId);
+    if (!owner) return undefined;
+    ownedAgents.delete(input.agentId);
 
-    watch.eventAgentId = event.agentId;
-    debug(`screener event id ${event.agentId} (task id ${watch.agentId ?? "pending"})`);
+    const response = typeof input.response === "string" ? input.response : "";
+    let cancel;
+    try {
+        cancel = Promise.resolve(owner.rpc.tasks.cancel({ id: input.agentId })).then(
+            (result) => result?.cancelled === true,
+            () => false,
+        );
+    } catch {
+        cancel = Promise.resolve(false);
+    }
+    // Handed over before awaiting anything: the poll loop must never see the "cancelled" status
+    // this produces without the reply that came with it.
+    owner.settle({ response, cancel });
+
+    debug(
+        (await cancel)
+            ? `${owner.label} ${input.agentId} cancelled at stop (notification suppressed)`
+            : `${owner.label} ${input.agentId} settled before cancel — notification will fire`,
+    );
+    return undefined;
 }
 
-function noteScreenerMessage(event) {
-    const watch = screenerWatch;
-    if (!watch || !watch.agentId || !event?.agentId) return;
-    if (event.agentId !== watch.eventAgentId) return;
-    const content = event?.data?.content;
-    // Which shape counts as "finished" depends on what this sub-agent was asked for. Hard-coding
-    // the verdict shape here meant the drafter was never recognised, so it ran to completion and
-    // the CLI announced it to the main agent — the exact noise the early cancel exists to prevent.
-    if (!watch.recognise(content)) return;
-    screenerWatch = null;
-    watch.onVerdict(content);
-}
-
-async function runScreener(session, prompt, { recognise = looksLikeVerdict, label = "screener" } = {}) {
+async function runScreener(session, prompt, { label = "screener" } = {}) {
     const rpc = session.rpc;
     if (!rpc?.tasks?.startAgent) throw new Error("session.rpc.tasks.startAgent unavailable");
 
@@ -609,53 +627,28 @@ async function runScreener(session, prompt, { recognise = looksLikeVerdict, labe
         baseline = 0;
     }
 
-    let earlyReply = null;
-    let cancelledEarly = false;
-    let signalEarly;
-    const earlyVerdict = new Promise((resolve) => {
-        signalEarly = resolve;
+    const model = cfg("screenerModel");
+    const { agentId } = await rpc.tasks.startAgent({
+        agentType: cfg("agentType"),
+        prompt,
+        name: "self-learn",
+        description: SCREENER_DESCRIPTION,
+        model,
     });
 
-    const watch = {
-        agentId: null,
-        eventAgentId: null,
-        promptHead: prompt.slice(0, 160),
-        recognise,
-        onVerdict: (content) => {
-            earlyReply = content;
-            // Cancel before awaiting anything, so the agent cannot settle in the gap.
-            rpc.tasks
-                .cancel({ id: watch.agentId })
-                .then((result) => {
-                    cancelledEarly = result?.cancelled === true;
-                    debug(
-                        cancelledEarly
-                            ? `${label} cancelled on reply (notification suppressed)`
-                            : `${label} settled before cancel — notification will fire`,
-                    );
-                })
-                .catch((err) => debug(`cancel-on-reply failed: ${err?.message ?? err}`))
-                .finally(signalEarly);
+    let stopResult = null;
+    let signalStop;
+    const stopped = new Promise((resolve) => {
+        signalStop = resolve;
+    });
+    ownedAgents.set(agentId, {
+        label,
+        rpc,
+        settle: (result) => {
+            stopResult = result;
+            signalStop();
         },
-    };
-    // Installed first: `subagent.started` can otherwise land before the id comes back.
-    screenerWatch = watch;
-
-    let agentId;
-    const model = cfg("screenerModel");
-    try {
-        ({ agentId } = await rpc.tasks.startAgent({
-            agentType: cfg("agentType"),
-            prompt,
-            name: "self-learn",
-            description: SCREENER_DESCRIPTION,
-            model,
-        }));
-    } catch (err) {
-        screenerWatch = null;
-        throw err;
-    }
-    watch.agentId = agentId;
+    });
     debug(`${label} ${agentId} started on ${model} (baseline ${baseline})`);
 
     const deadline = Date.now() + cfg("timeoutMs");
@@ -664,11 +657,8 @@ async function runScreener(session, prompt, { recognise = looksLikeVerdict, labe
 
     try {
         while (Date.now() < deadline) {
-            await Promise.race([
-                earlyVerdict,
-                new Promise((r) => setTimeout(r, cfg("pollIntervalMs"))),
-            ]);
-            if (earlyReply) return earlyReply;
+            await Promise.race([stopped, new Promise((r) => setTimeout(r, cfg("pollIntervalMs")))]);
+            if (stopResult) return stopResult.response;
 
             let tasks = [];
             try {
@@ -676,6 +666,8 @@ async function runScreener(session, prompt, { recognise = looksLikeVerdict, labe
             } catch (err) {
                 throw new Error(`tasks.list failed: ${err?.message ?? err}`);
             }
+            // The hook may have fired, and cancelled the task, while the list was in flight.
+            if (stopResult) return stopResult.response;
 
             const task = tasks.find((t) => t.id === agentId);
             if (!task) {
@@ -685,64 +677,53 @@ async function runScreener(session, prompt, { recognise = looksLikeVerdict, labe
             seen = true;
 
             if (task.status === "failed") throw new Error(task.error || "screener failed");
-            if (task.status === "cancelled") return earlyReply ?? "";
+            if (task.status === "cancelled") return "";
 
             // Exact correlation: these are keyed by the task id we own, so unlike event-log
             // matching they cannot pick up another extension's or the main agent's sub-agent.
             if (task.result) {
-                debug(`reply via task.result`);
+                debug(`reply via task.result (stop hook did not fire)`);
                 return task.result;
             }
             if (task.latestResponse) {
-                debug(`reply via task.latestResponse`);
+                debug(`reply via task.latestResponse (stop hook did not fire)`);
                 return task.latestResponse;
             }
 
-            const { status, reply } = await readReplyFromEventLog(session, baseline, watch.eventAgentId);
+            const { status, reply } = await readReplyFromEventLog(session, baseline, agentId);
+            if (stopResult) return stopResult.response;
             if (status === "failed") throw new Error(reply);
             if (status === "done") {
-                debug(`reply via event log (fallback)`);
+                debug(`reply via event log (stop hook did not fire)`);
                 return reply;
             }
 
             if (task.status === "completed" || task.status === "idle") {
                 if (++emptySettledPolls >= SETTLED_EMPTY_POLL_LIMIT) {
-                    debug(`screener ${agentId} settled with no reply`);
+                    debug(`${label} ${agentId} settled with no reply`);
                     return "";
                 }
             } else {
                 emptySettledPolls = 0;
             }
         }
-        throw new Error(`screener timed out after ${cfg("timeoutMs")}ms`);
+        throw new Error(`${label} timed out after ${cfg("timeoutMs")}ms`);
     } finally {
-        if (screenerWatch === watch) {
-            // Two failed live runs were each diagnosed only after the fact. If identity was never
-            // resolved, record which sub-agent events actually arrived, so the next failure is
-            // self-explanatory instead of costing another run.
-            if (!watch.eventAgentId) {
-                const sub = [...deliveredTypes.keys()].filter((k) => k.endsWith("@sub"));
-                debug(`screener never identified in the event stream; sub-agent types seen: ${sub.join(", ") || "none"}`);
-            }
-            screenerWatch = null;
-        }
-        await disposeTask(rpc, agentId, cancelledEarly);
+        ownedAgents.delete(agentId);
+        await disposeTask(rpc, agentId, stopResult ? await stopResult.cancel : false);
     }
 }
 
-// Correlated by the event-stream agent id the watch resolved from the prompt prefix, which is the
-// only key here that has ever worked. Two earlier keys were wrong: `data.agentDescription` is the
-// agent *type's* blurb rather than the per-call description, so matching it against our own
-// description scored 0 across 1357 `subagent.started` events on this machine; and falling back to
-// `data.model` would happily claim the advisor extension's sub-agent whenever it ran the same
-// model, which is precisely the silent cross-wiring this must avoid. The task id cannot be used
-// either — it is a name like `self-learn-1`, while the event stream uses `bg-<uuid>`.
+// Keyed by the task id `tasks.startAgent` returned, which the event stream also uses as the
+// sub-agent's `agentId` on runtimes that have the stop hook. A runtime that names the two
+// differently finds nothing here, leaving `latestResponse` as its fallback. Matching by anything
+// looser is ruled out: `data.agentDescription` is the agent *type's* blurb rather than the
+// per-call description, and `data.model` would claim the advisor extension's sub-agent whenever
+// it ran the same model — precisely the silent cross-wiring this must avoid.
 //
-// Waiting for `subagent.completed` is deliberate here: this is the fallback for when the watch
-// never fired, so an earlier `assistant.message` could still be an intermediate one. Cancellation
-// (and with it notification suppression) is the watch's job, not this function's.
+// Waiting for `subagent.completed` is deliberate: an earlier `assistant.message` could still be an
+// intermediate one.
 async function readReplyFromEventLog(session, baseline, eventAgentId) {
-    // Identity not resolved yet — keep waiting rather than guess at a stranger's sub-agent.
     if (!eventAgentId) return { status: "pending", reply: "" };
 
     let events = [];
@@ -870,20 +851,22 @@ async function screen(session, { force = false, lookback = 0 } = {}) {
 // Stage 2/3: escalation, approval, and writing
 // ---------------------------------------------------------------------------
 
-// Derive the skills directory from the runtime's own reported paths rather than hardcoding it,
-// falling back to the documented personal location.
-async function resolveSkillsRoot(session) {
+// The one directory self-learn writes skills into. Unless configured, it is derived from where the
+// runtime reports the user's own skills, falling back to the documented personal location.
+function skillsRootFrom(skills) {
     const configured = cfg("skillsRoot");
     if (configured) return resolve(configured);
+    return personalSkillsRoot(skills, join(homedir(), ".agents", "skills"));
+}
 
+async function resolveSkillsRoot(session) {
+    if (cfg("skillsRoot")) return skillsRootFrom([]);
     try {
         const { skills } = await session.rpc.skills.list();
-        const sample = skills.find((s) => s.path && s.source !== "plugin");
-        if (sample) return resolve(dirname(dirname(sample.path)));
+        return skillsRootFrom(skills);
     } catch {
-        // Fall through to the default.
+        return skillsRootFrom([]);
     }
-    return join(homedir(), ".agents", "skills");
 }
 
 // Resolves a skill's file path, enforcing that writes stay inside the user's personal skills root.
@@ -927,19 +910,39 @@ async function resolveSkillFile(session, name, { mode = "new" } = {}) {
     return { dir, file: join(dir, "SKILL.md") };
 }
 
+const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+
 async function writeSkill(session, p) {
     const { dir, file } = await resolveSkillFile(session, p.name, { mode: p.mode });
     const existed = existsSync(file);
 
+    // What this draft has already written, by path relative to the skill directory. A retry after a
+    // partly failed write must not back up its own first attempt over the original in .bak, and an
+    // extend must not append to it. Matched on content, so a file edited by hand since then is
+    // treated as the user's again.
+    const writes = (p.writes ??= {});
+    const ours = (target, key) =>
+        typeof writes[key] === "string" && existsSync(target) && statSync(target).isFile() &&
+        writes[key] === sha256(readFileSync(target));
+    const write = (target, key, text) => {
+        writeFileSync(target, text, "utf8");
+        writes[key] = sha256(Buffer.from(text, "utf8"));
+    };
+
     // Keyed on existence, not on the declared mode: a proposal claiming mode "new" whose name
     // collides with an existing skill would otherwise destroy a hand-written file with no backup.
-    const backup = (target) => {
+    const backup = (target, key) => {
         if (!existsSync(target)) return;
+        if (ours(target, key)) {
+            debug(`kept ${target}.bak: ${target} is this draft's own earlier attempt`);
+            return;
+        }
         copyFileSync(target, `${target}.bak`);
         debug(`backed up ${target} -> ${target}.bak`);
     };
 
-    backup(file);
+    const retrying = ours(file, "SKILL.md");
+    backup(file, "SKILL.md");
     mkdirSync(dir, { recursive: true });
 
     let content;
@@ -947,7 +950,9 @@ async function writeSkill(session, p) {
         if (!existed) {
             throw new Error(`"${p.name}" does not exist, so there is nothing to extend.`);
         }
-        content = appendSection(readFileSync(file, "utf8"), p);
+        // On a retry SKILL.md already holds this section, so extend the original kept in .bak.
+        const base = retrying ? `${file}.bak` : file;
+        content = appendSection(readFileSync(base, "utf8"), p);
         // Checked against the assembled file rather than the new section alone: the point of the
         // cap is what a future session pays to load the skill, and an umbrella only ever grows.
         const size = Buffer.byteLength(content, "utf8");
@@ -961,7 +966,7 @@ async function writeSkill(session, p) {
         content = renderSkillFile(p);
     }
 
-    writeFileSync(file, content, "utf8");
+    write(file, "SKILL.md", content);
     debug(`wrote ${file} (mode=${p.mode}, existed=${existed})`);
 
     const dirWithSep = dir.endsWith(sep) ? dir : dir + sep;
@@ -972,9 +977,9 @@ async function writeSkill(session, p) {
         if (!target.startsWith(dirWithSep)) {
             throw new Error(`refusing to write outside the skill directory: ${target}`);
         }
-        backup(target);
+        backup(target, f.path);
         mkdirSync(dirname(target), { recursive: true });
-        writeFileSync(target, f.content, "utf8");
+        write(target, f.path, f.content);
         debug(`wrote ${target} (${Buffer.byteLength(f.content, "utf8")} bytes)`);
     }
 
@@ -1014,8 +1019,16 @@ async function readExistingSkill(session, name, mode) {
 }
 
 function buildDrafterPrompt(verdict, transcript, existing) {
+    const retarget = verdict.retargetedFrom;
     let target;
-    if (verdict.target === "extend") {
+    if (retarget) {
+        const correcting = retarget.target === "refine";
+        target = `This lesson was meant to ${correcting ? "correct" : "extend"} the skill \
+"${retarget.skill}", but that skill belongs to a repository, a plugin or the runtime and cannot be \
+changed here. Write it as a NEW personal skill that stands on its own\
+${correcting ? `, stating the correction to what "${retarget.skill}" says` : ""}. Give it a short \
+kebab-case "name" that is not "${retarget.skill}" and not the name of any other existing skill.`;
+    } else if (verdict.target === "extend") {
         target = `Add to the existing skill "${verdict.skill}". Write ONLY the new section: the \
 extension appends it verbatim and never rewrites what is already there, so do NOT reproduce any \
 existing content. Put a short title in "section", and just that section's text in "body". Supply \
@@ -1029,9 +1042,13 @@ wrong, not for adding a case it simply does not cover.`;
         target = `Create a new skill named "${verdict.skill}".`;
     }
 
-    const current = existing
-        ? `\n\nThe skill as it stands today:\n\n<current_skill>\n${truncate(existing, EXISTING_SKILL_BUDGET)}\n</current_skill>`
-        : "";
+    const current = !existing
+        ? ""
+        : retarget
+          ? `\n\nThe read-only skill "${retarget.skill}", for reference — do not repeat what it \
+already says:\n\n<current_skill>\n${truncate(existing, EXISTING_SKILL_BUDGET)}\n</current_skill>`
+          : `\n\nThe skill as it stands today:\n\n<current_skill>\n${truncate(existing, EXISTING_SKILL_BUDGET)}\n</current_skill>`;
+    const nameField = retarget ? `\n  "name": "kebab-case-name",` : "";
 
     return `You are drafting a reusable skill file from the transcript of a coding session. A \
 reviewer model has already judged that this session contains a durable, reusable lesson; your job \
@@ -1053,7 +1070,7 @@ none, because it will be trusted.
 
 Reply with ONE JSON object and nothing else:
 
-{
+{${nameField}
   "description": "one line saying when a future agent should load this skill",
   "section": "short plain-text title, 3-80 chars (mode extend only)",
   "body": "the markdown body",
@@ -1070,6 +1087,39 @@ ${transcript}
 
 // Returns { proposal }, { decline, reason }, or { error }.
 async function draft(session, verdict, transcript) {
+    let skills = [];
+    try {
+        ({ skills } = await session.rpc.skills.list());
+    } catch (err) {
+        debug(`skills.list failed before drafting: ${err?.message ?? err}`);
+    }
+    const root = skillsRootFrom(skills);
+
+    // An extend or refine of a skill self-learn cannot write — a repository's, a plugin's or a
+    // bundled one — would only fail at approval, after the user had read the draft. The lesson is
+    // still worth keeping, so it is drafted as a new personal skill instead, with the read-only
+    // skill shown for reference. A name the runtime does not report at all is left to fail below:
+    // that is a screener mistake, not a read-only skill.
+    let related = null;
+    if (verdict.target !== "new") {
+        const named =
+            skills.find((s) => s.name === verdict.skill && s.path) ??
+            skills.find((s) => s.name === verdict.skill);
+        if (named && !isInsideRoot(named.path, root)) {
+            try {
+                related = named.path ? readFileSync(named.path, "utf8") : null;
+            } catch (err) {
+                debug(`could not read read-only skill "${verdict.skill}": ${err?.message ?? err}`);
+            }
+            debug(`"${verdict.skill}" is read-only, so the ${verdict.target} is drafted as a new skill`);
+            verdict = {
+                ...verdict,
+                target: "new",
+                retargetedFrom: { skill: verdict.skill, target: verdict.target },
+            };
+        }
+    }
+
     const existing =
         verdict.target === "new"
             ? null
@@ -1083,18 +1133,28 @@ async function draft(session, verdict, transcript) {
         };
     }
 
-    let prompt = buildDrafterPrompt(verdict, transcript, existing);
+    // The drafter names a re-targeted skill, and a name already in use would turn the new skill
+    // into an overwrite of the user's own skill, or one shadowing a read-only skill.
+    const nameTaken = (name) => {
+        const lower = name.toLowerCase();
+        const listed = skills.some((s) => typeof s.name === "string" && s.name.toLowerCase() === lower);
+        return listed || existsSync(join(root, name))
+            ? `a skill named "${name}" already exists; choose a different name for this new skill`
+            : null;
+    };
+
+    let prompt = buildDrafterPrompt(verdict, transcript, existing ?? related);
 
     for (let attempt = 1; attempt <= DRAFT_ATTEMPTS; attempt++) {
-        const raw = await runScreener(session, prompt, {
-            recognise: looksLikeDraft,
-            label: "drafter",
-        });
+        const raw = await runScreener(session, prompt, { label: "drafter" });
         const result = parseDraft(raw, verdict);
 
         if (result.decline) return result;
 
-        const problem = result.error ?? validateProposal(result.proposal, cfg("maxSkillBytes"));
+        const problem =
+            result.error ??
+            validateProposal(result.proposal, cfg("maxSkillBytes")) ??
+            (verdict.retargetedFrom ? nameTaken(result.proposal.name) : null);
         if (!problem) {
             debug(`draft ready on attempt ${attempt}`);
             return result;
@@ -1157,9 +1217,11 @@ async function screenAndDraft(session, opts = {}) {
     // Parked rather than logged now: this runs after `session.idle`, where there is no live turn
     // for an extension log to render into. `onAgentStop` flushes it at the start of the next turn's
     // end, alongside the approval dialog it belongs with.
+    const retargeted = result.proposal.retargetedFrom;
     state.pendingAnnouncement =
-        `self-learn: drafted ${result.proposal.mode} "${result.proposal.name}" — ` +
-        `approve or decline it below`;
+        `self-learn: drafted ${result.proposal.mode} "${result.proposal.name}"` +
+        (retargeted ? ` (instead of ${retargeted.target === "refine" ? "refining" : "extending"} read-only "${retargeted.skill}")` : "") +
+        ` — approve or decline it below`;
     return verdict;
 }
 
@@ -1171,8 +1233,10 @@ async function screenAndDraft(session, opts = {}) {
 // Owns `state.resolvingProposal` itself, including clearing it: callers must not set that flag
 // before calling, or the guard below fires and the dialog never opens.
 //
+// `signal` is the tool call's, when the dialog is raised from one; see `awaitAnswer`.
+//
 // Returns what happened, so the caller can report it.
-async function resolvePendingProposal(session) {
+async function resolvePendingProposal(session, { signal } = {}) {
     const p = state.pendingProposal;
     if (!p || p.deferred) return "none";
 
@@ -1198,10 +1262,13 @@ async function resolvePendingProposal(session) {
     }
     persistPendingProposal(session);
 
-    const discard = (reason) => {
-        state.pendingProposal = null;
-        persistPendingProposal(session);
-        debug(`proposal "${p.name}" discarded: ${reason}`);
+    const discard = (reason) => discardProposal(session, p, reason);
+    // An earlier, expired dialog for this same draft was answered Yes, and that answer has written
+    // it or is writing it. The user chose that this dialog then decides nothing: no second write,
+    // and no decline recorded for a No.
+    const approvedLate = () => {
+        debug(`proposal "${p.name}": already approved on an expired dialog; nothing more to decide`);
+        return "written";
     };
 
     try {
@@ -1281,14 +1348,22 @@ take effect until you re-enable it.`
         // renders as `...\me.agents\...`, which reads as a path bug that is not there. A code span
         // suppresses escape processing, so the path shows exactly as it is on disk.
         const pathNote = `\n\nFile: \`${target.file}\``;
+        const retargetNote =
+            typeof p.retargetedFrom?.skill === "string"
+                ? `\n\nDrafted as a new personal skill because "${p.retargetedFrom.skill}" is read-only here.`
+                : "";
 
-        const message = `self-learn wants to ${where}.\n\n${lead}\
+        const message = `self-learn wants to ${where}.${retargetNote}\n\n${lead}\
 ${heading}${closeOpenFence(truncate(p.body, 800))}\
 ${filesNote}${backupNote}${pathNote}${disabledNote}\n\nWrite it?`;
 
-        let approved = false;
+        // Checked before the dialog and again after it: the earlier dialog can be answered at any
+        // time, including while the path above was being looked up.
+        if (approvedOnce.has(p)) return approvedLate();
+
+        let reply;
         try {
-            approved = await session.ui.confirm(message);
+            reply = await awaitAnswer(session, message, signal);
         } catch (err) {
             // Kept for another attempt: the host may not have been ready to show a dialog.
             state.lastError = `confirm failed: ${err?.message ?? err}`;
@@ -1296,30 +1371,129 @@ ${filesNote}${backupNote}${pathNote}${disabledNote}\n\nWrite it?`;
             return "retained";
         }
 
-        if (!approved) {
+        if (approvedOnce.has(p)) return approvedLate();
+
+        if (reply.ended) {
+            // Not counted against the attempt limit: an unanswered dialog says nothing about the
+            // draft, and counting it would discard a good one after a few unattended stops.
+            p.attempts -= 1;
+            if (state.pendingProposal === p) persistPendingProposal(session);
+            state.lastError = `approval dialog ${reply.ended}`;
+            debug(`proposal "${p.name}" kept: ${state.lastError}`);
+            reply.answer.then(
+                (approved) => answeredLate(session, p, approved),
+                (err) => debug(`proposal "${p.name}": expired approval dialog failed: ${err?.message ?? err}`),
+            );
+            return "retained";
+        }
+
+        if (!reply.approved) {
             recordDecline({ name: p.name, why: p.why, by: "user" });
             discard("declined by user");
             await say(`self-learn: discarded proposal for "${p.name}"`);
             return "declined";
         }
 
-        let outcome = "written";
-        try {
-            const file = await writeSkill(session, p);
-            discard("written");
-            state.written++;
-            await say(`self-learn: wrote ${file}`);
-        } catch (err) {
-            // Kept so a transient failure (locked file, transient FS error) can be retried.
-            state.lastError = `write failed: ${err?.message ?? err}`;
-            debug(`${state.lastError} — proposal "${p.name}" retained for retry`);
-            await say(`self-learn: write failed, proposal kept — ${state.lastError}`);
-            outcome = "retained";
-        }
-        return outcome;
+        return await writeApproved(session, p);
     } finally {
         state.resolvingProposal = false;
     }
+}
+
+// `session.ui.confirm` takes no signal, and only an experimental RPC can close an open dialog, so
+// nothing here ends a dialog — only the wait for it. Unbounded, that wait held the approval latch
+// for eight days in session 8282634f: the host gave up on the `propose_skill` call after exactly
+// 1800s and aborted its signal, the dialog never settled, and every later stop was skipped as "a
+// dialog is already open". A tool call's wait now ends with its signal; the stop hook has none, so
+// its wait ends after `approvalTimeoutMs`. The dialog may still be answered afterwards, so the
+// answer is handed back for `answeredLate`.
+async function awaitAnswer(session, message, signal) {
+    const answer = session.ui.confirm(message);
+    let release = () => {};
+    const ended = new Promise((resolve) => {
+        if (signal) {
+            const onAbort = () => resolve("abandoned when its tool call ended");
+            if (signal.aborted) return onAbort();
+            signal.addEventListener("abort", onAbort, { once: true });
+            release = () => signal.removeEventListener("abort", onAbort);
+            return;
+        }
+        // Node runs a delay above 2^31-1 ms after 1 ms, which would turn a long timeout into none.
+        const timeoutMs = Math.min(cfg("approvalTimeoutMs"), 2 ** 31 - 1);
+        if (!(timeoutMs > 0)) return;
+        const timer = setTimeout(() => resolve(`timed out after ${timeoutMs}ms`), timeoutMs);
+        timer.unref?.();
+        release = () => clearTimeout(timer);
+    });
+    try {
+        return await Promise.race([
+            answer.then((approved) => ({ approved })),
+            ended.then((reason) => ({ ended: reason, answer })),
+        ]);
+    } finally {
+        release();
+    }
+}
+
+// An answer to a dialog whose wait already ended. A Yes is still the user's approval of exactly
+// this draft, so it is written while that draft is the pending one — even when a newer dialog for
+// it is open, which then decides nothing (see `approvedOnce`). Anything else is ignored and the
+// draft is offered again at the next stop: `confirm` reports a No and a dismissal alike as false,
+// so a late false cannot be told apart from the dialog simply being closed.
+async function answeredLate(session, p, approved) {
+    if (approved !== true) {
+        debug(`proposal "${p.name}": late No or dismissal of an expired dialog ignored; kept`);
+        return;
+    }
+    if (state.pendingProposal !== p || approvedOnce.has(p)) {
+        const why = state.pendingProposal !== p ? "it is no longer pending" : "it is already being written";
+        debug(`proposal "${p.name}": late approval ignored, ${why}`);
+        return;
+    }
+    // The approval latch is left alone: it opens no dialog, and a held latch belongs to the newer
+    // dialog for this draft, which `approvedOnce` already stops from deciding again.
+    try {
+        debug(`proposal "${p.name}" approved late, on an expired dialog`);
+        await writeApproved(session, p);
+    } catch (err) {
+        debug(`proposal "${p.name}": late approval failed: ${err?.message ?? err}`);
+    }
+}
+
+// Drafts whose approved write is under way or done, so that two Yeses for one draft — a late one
+// and the newer dialog's — write it once. Claimed before the write's first await and released if
+// the write fails, so the draft can still be approved again. Kept in memory rather than on the
+// proposal: the proposal is persisted, and a reload mid-write would strand a persisted claim.
+const approvedOnce = new WeakSet();
+
+async function writeApproved(session, p) {
+    approvedOnce.add(p);
+    try {
+        const file = await writeSkill(session, p);
+        discardProposal(session, p, "written");
+        state.written++;
+        await say(`self-learn: wrote ${file}`);
+        return "written";
+    } catch (err) {
+        approvedOnce.delete(p);
+        // Saves what the failed attempt already wrote (`p.writes`), so the retry recognises it.
+        if (state.pendingProposal === p) persistPendingProposal(session);
+        // Kept so a transient failure (locked file, transient FS error) can be retried.
+        state.lastError = `write failed: ${err?.message ?? err}`;
+        debug(`${state.lastError} — proposal "${p.name}" retained for retry`);
+        await say(`self-learn: write failed, proposal kept — ${state.lastError}`);
+        return "retained";
+    }
+}
+
+// Clears `p` only if it is still the pending proposal: a dialog can outlive the proposal it
+// showed, and clearing unconditionally would destroy whichever draft replaced it.
+function discardProposal(session, p, reason) {
+    if (state.pendingProposal === p) {
+        state.pendingProposal = null;
+        persistPendingProposal(session);
+    }
+    debug(`proposal "${p.name}" discarded: ${reason}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -1850,7 +2024,8 @@ const session = await joinSession({
                 // Confirmed here, inside the open tool call, rather than at idle. The dialog then
                 // belongs to a turn the host can finish; raised after the turn ended, the approval
                 // resolved and the write succeeded but the app stayed stuck showing "running".
-                const outcome = await resolvePendingProposal(session);
+                // The call's signal ends the wait if the host gives up on the call first.
+                const outcome = await resolvePendingProposal(session, { signal: invocation?.signal });
                 switch (outcome) {
                     case "written":
                         return `Approved and written. Tell the user the skill "${proposal.name}" was saved.`;
@@ -1906,6 +2081,7 @@ const session = await joinSession({
             }
             if (!state.pendingProposal || state.pendingProposal.deferred) return;
 
+            // Bounded by `approvalTimeoutMs`: this hook has no signal to end the wait otherwise.
             try {
                 const outcome = await resolvePendingProposal(session);
                 debug(`agentStop: proposal resolved -> ${outcome}`);
@@ -1914,6 +2090,8 @@ const session = await joinSession({
             }
         },
 
+        // Claims the stop of a screener or drafter this extension started, and ignores all others.
+        onSubagentStop,
     },
 
     commands: [
@@ -2022,11 +2200,7 @@ session.on((event) => {
     const key = `${event?.type}${event?.agentId ? "@sub" : ""}`;
     deliveredTypes.set(key, (deliveredTypes.get(key) ?? 0) + 1);
     if (event?.type === "external_tool.requested") noteSubAgentToolCall(event);
-    if (event?.type === "user.message") {
-        noteScreenerPrompt(event);
-        handleUserMessage(event);
-    }
-    if (event?.type === "assistant.message") noteScreenerMessage(event);
+    if (event?.type === "user.message") handleUserMessage(event);
     if (event?.type === "tool.execution_start") {
         noteSubAgentToolCall(event);
         countToolCall(event);

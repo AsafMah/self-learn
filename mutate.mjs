@@ -67,17 +67,23 @@ const M = [
   ["append-trim", "body not trimmed before append", "const body = parts.body.trim();", "const body = parts.body;"],
   ["frontmatter-greedy", "frontmatter regex greedy", "const match = /^---\\r?\\n([\\s\\S]*?)\\r?\\n---\\r?\\n?/.exec(text);", "const match = /^---\\r?\\n([\\s\\S]*)\\r?\\n---\\r?\\n?/.exec(text);"],
 
-  // --- sub-agent recognisers ---
-  ["draft-empty-body", "empty body counts as a finished draft", 'if (typeof obj.body === "string" && obj.body.trim()) return true;', 'if (typeof obj.body === "string") return true;'],
-  ["verdict-any-object", "any JSON object counts as a verdict", 'if (obj && typeof obj === "object" && obj.criteria) return true;', 'if (obj && typeof obj === "object") return true;'],
-
   // --- main-agent stop guard ---
   ["stop-prefix", "bg- prefix test instead of equality", "return id === mainSessionId;", 'return !id.startsWith("bg-");'],
   ["stop-empty-id", "empty session id accepted", 'if (typeof id !== "string" || id === "") return false;', 'if (typeof id !== "string") return false;'],
 
   // --- drafter may not override the screener ---
   ["draft-mode", "drafter overrides screener mode", "mode: verdict.target,", "mode: parsed.mode ?? verdict.target,"],
-  ["draft-name", "drafter overrides screener skill name", "name: verdict.skill,", "name: parsed.name ?? verdict.skill,"],
+  ["draft-name", "drafter overrides screener skill name", "name: verdict.retargetedFrom ? sanitize(parsed.name, 80) : verdict.skill,", "name: verdict.retargetedFrom ? sanitize(parsed.name, 80) : parsed.name ?? verdict.skill,"],
+  ["draft-retarget-name", "re-targeted draft reuses the read-only name", "name: verdict.retargetedFrom ? sanitize(parsed.name, 80) : verdict.skill,", "name: verdict.skill,"],
+  ["draft-retarget-kept", "re-targeting dropped from the proposal", "...(verdict.retargetedFrom ? { retargetedFrom: verdict.retargetedFrom } : {}),", ""],
+
+  // --- the writable skills root ---
+  ["root-any-source", "root derived from any skill with a path", "s?.source === source && ", ""],
+  ["root-order", "personal-copilot preferred over personal-agents", 'const PERSONAL_SKILL_SOURCES = ["personal-agents", "personal-copilot"];', 'const PERSONAL_SKILL_SOURCES = ["personal-copilot", "personal-agents"];'],
+  ["root-path-guard", "personal skill without a path accepted", 'typeof s.path === "string" && s.path !== ""', "true"],
+  ["inside-root-sep", "sibling directory counts as inside the root", "const rootWithSep = root.endsWith(sep) ? root : root + sep;", "const rootWithSep = root;"],
+  ["inside-root-double-sep", "root with a trailing separator rejects its own skills", "const rootWithSep = root.endsWith(sep) ? root : root + sep;", "const rootWithSep = root + sep;"],
+  ["inside-root-guard", "pathless skill not rejected up front", 'if (typeof path !== "string" || path === "") return false;', "if (false) return false;"],
 
   // --- json scanning ---
   ["json-instring", "braces inside strings break scanning", "if (inString) continue;", "if (false) continue;"],

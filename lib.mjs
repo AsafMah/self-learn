@@ -6,6 +6,8 @@
 // than read from `cfg`. This is the code with real invariants — what may be written where, and
 // what counts as a verdict — so it is the code worth a test.
 
+import { dirname, resolve, sep } from "node:path";
+
 // The verdict is computed from these in code, not reported by the model, so it cannot shortcut
 // to "yes" by asserting a conclusion. Every criterion must pass.
 export const RUBRIC_CRITERIA = ["surprising", "expensive", "undiscoverable", "transferable", "uncovered"];
@@ -143,42 +145,6 @@ export function parseVerdict(raw, transcript) {
     };
 }
 
-// Accepts exactly what `parseVerdict` accepts, so the screener is never cut off on a message the
-// parser would then reject.
-// Whether a sub-agent message is a finished draft, in the same sense `looksLikeVerdict` recognises
-// a finished verdict: enough to cancel on, before the host emits a completion event.
-//
-// This must exist separately. Cancelling early is what suppresses the CLI's "agent has finished"
-// notification to the main agent, and a drafter's reply is not verdict-shaped, so recognising only
-// verdicts leaves every drafter running to completion and announcing itself.
-export function looksLikeDraft(text) {
-    if (typeof text !== "string") return false;
-    for (const candidate of extractJsonObjects(text)) {
-        try {
-            const obj = JSON.parse(candidate);
-            if (!obj || typeof obj !== "object") continue;
-            if (obj.decline === true) return true;
-            if (typeof obj.body === "string" && obj.body.trim()) return true;
-        } catch {
-            // Keep looking for a well-formed object.
-        }
-    }
-    return false;
-}
-
-export function looksLikeVerdict(text) {
-    if (typeof text !== "string") return false;
-    for (const candidate of extractJsonObjects(text)) {
-        try {
-            const obj = JSON.parse(candidate);
-            if (obj && typeof obj === "object" && obj.criteria) return true;
-        } catch {
-            // Keep looking for a well-formed object.
-        }
-    }
-    return false;
-}
-
 // Rejects anything that is not a plain relative path inside the skill directory, and returns the
 // path in normalised form. Callers still re-check the resolved path against the directory before
 // writing: this is a filter on what the agent may ask for, not the last line of defence.
@@ -271,6 +237,29 @@ export function renderSkillFile(p) {
     return `---\nname: ${oneLine(p.name)}\ndescription: ${oneLine(p.description)}\n---\n\n${p.body.trim()}\n`;
 }
 
+// The runtime's personal skill tiers, in the order the write root is derived from them.
+const PERSONAL_SKILL_SOURCES = ["personal-agents", "personal-copilot"];
+
+// Where the user's own skills live when no root is configured, judged only from skills the
+// runtime reports as personal. A repository's `.github/skills`, a plugin cache or a custom
+// directory says nothing about where the user keeps theirs; deriving from whichever skill came
+// first once made a repository's skills look writable and the user's own look foreign.
+export function personalSkillsRoot(skills, fallback) {
+    for (const source of PERSONAL_SKILL_SOURCES) {
+        const sample = skills.find((s) => s?.source === source && typeof s.path === "string" && s.path !== "");
+        if (sample) return resolve(dirname(dirname(sample.path)));
+    }
+    return fallback;
+}
+
+// Whether a skill file lies inside the writable root. A skill the runtime reports without a path
+// (a bundled one) is never writable.
+export function isInsideRoot(path, root) {
+    if (typeof path !== "string" || path === "") return false;
+    const rootWithSep = root.endsWith(sep) ? root : root + sep;
+    return resolve(path).startsWith(rootWithSep);
+}
+
 // Which installed skills the user's own instructions point at.
 //
 // Measured, not assumed: across 411 recorded skill invocations, every personal skill with real
@@ -306,6 +295,10 @@ export function referencedSkillNames(text, names) {
 // the drafter's reply: letting the drafter choose them would let it quietly create a new skill
 // when the screener had decided to extend an existing one, which is exactly the accumulation of
 // narrow write-only skills that extending exists to avoid.
+//
+// The one exception is a verdict the extension itself re-targeted, because the skill it named is
+// read-only. That lesson can only become a new skill, which the extension has already made its
+// mode, and only the drafter has a name for it — reusing the read-only skill's would shadow it.
 export function parseDraft(raw, verdict) {
     const candidates = extractJsonObjects(raw);
     if (candidates.length === 0) return { error: "no JSON object in drafter reply" };
@@ -331,7 +324,7 @@ export function parseDraft(raw, verdict) {
     return {
         proposal: {
             mode: verdict.target,
-            name: verdict.skill,
+            name: verdict.retargetedFrom ? sanitize(parsed.name, 80) : verdict.skill,
             // Sanitized generously rather than to the validator's limit: truncating to exactly the
             // maximum would turn an over-long title into a silently passing one, where letting it
             // fail validation sends the drafter a correction it can act on.
@@ -340,6 +333,7 @@ export function parseDraft(raw, verdict) {
             body: typeof parsed.body === "string" ? parsed.body : "",
             files: parsed.files,
             why: verdict.rationale,
+            ...(verdict.retargetedFrom ? { retargetedFrom: verdict.retargetedFrom } : {}),
         },
     };
 }

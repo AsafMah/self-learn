@@ -2,7 +2,6 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
     parseVerdict,
-    looksLikeVerdict,
     sanitize,
     normaliseSkillFilePath,
     referencedSkillNames,
@@ -12,9 +11,11 @@ import {
     appendSection,
     parseDraft,
     isMainAgentStop,
-    looksLikeDraft,
     extractJsonObjects,
+    personalSkillsRoot,
+    isInsideRoot,
 } from "./lib.mjs";
+import { join, resolve, sep } from "node:path";
 
 const LIMIT = 65536;
 
@@ -118,26 +119,6 @@ test("a brace inside a quoted string does not break object scanning", () => {
         rationale: "the reply mentioned {braces} inline",
     });
     assert.equal(parseVerdict(raw, quote).worthLearning, true);
-});
-
-test("looksLikeVerdict accepts exactly what parseVerdict will parse", () => {
-    // The screener is cut off on this predicate, so a message it accepts but the parser rejects
-    // would lose the verdict entirely.
-    assert.equal(looksLikeVerdict(verdictJson()), true);
-    assert.equal(looksLikeVerdict("```json\n" + verdictJson() + "\n```"), true);
-    assert.equal(looksLikeVerdict("still thinking about it"), false);
-    assert.equal(looksLikeVerdict('{"notcriteria": 1}'), false);
-});
-
-test("neither recogniser fires on an empty or contentless reply", () => {
-    // The advisor extension found that its own `parseVerdict("")` returned a clean object rather
-    // than failing, so an empty first poll cancelled a sub-agent that was still working and was
-    // reported as a confident "no concerns". These predicates require specific keys rather than
-    // merely a successful parse, so they must reject anything that carries no verdict or draft.
-    for (const empty of ["", "   ", "\n\t", null, undefined, "{}", "[]"]) {
-        assert.equal(looksLikeVerdict(empty), false, `verdict recognised ${JSON.stringify(empty)}`);
-        assert.equal(looksLikeDraft(empty), false, `draft recognised ${JSON.stringify(empty)}`);
-    }
 });
 
 test("sanitize strips smuggled tags and refuses prompt injection", () => {
@@ -423,6 +404,18 @@ test("a reply with no JSON at all is an error, not a silent empty draft", () => 
     assert.equal(d.proposal, undefined);
 });
 
+test("an empty or contentless stop reply is neither a lesson nor a draft", () => {
+    // The stop hook hands over whatever the sub-agent ended its turn with, which can be nothing.
+    // The advisor extension once read an empty reply as a confident "no concerns"; here it must
+    // read as a failure to answer.
+    for (const empty of ["", "   ", "\n\t", "{}", "[]"]) {
+        const v = parseVerdict(empty, "transcript");
+        assert.equal(v.worthLearning, false, `verdict from ${JSON.stringify(empty)}`);
+        assert.ok(v.reason, `no reason for ${JSON.stringify(empty)}`);
+        assert.ok(parseDraft(empty, VERDICT).error, `draft from ${JSON.stringify(empty)}`);
+    }
+});
+
 test("a reply whose only JSON lacks a body is an error", () => {
     const d = parseDraft(JSON.stringify({ section: "x", description: "y" }), VERDICT);
     assert.ok(d.error);
@@ -437,33 +430,58 @@ test("an over-long section is left long enough to fail validation rather than tr
     );
 });
 
-// --- early-cancel recognition ----------------------------------------------
+const RETARGETED = {
+    target: "new",
+    skill: "repo-guide",
+    rationale: "because",
+    retargetedFrom: { skill: "repo-guide", target: "extend" },
+};
 
-test("a drafter reply is recognised as a draft", () => {
-    assert.equal(looksLikeDraft(draftJson()), true);
+test("a draft re-targeted away from a read-only skill is named by the drafter", () => {
+    const d = parseDraft(draftJson({ mode: "extend", name: "lockfile-cache-keys" }), RETARGETED);
+    assert.equal(d.proposal.mode, "new");
+    assert.equal(d.proposal.name, "lockfile-cache-keys");
+    assert.deepEqual(d.proposal.retargetedFrom, { skill: "repo-guide", target: "extend" });
+    assert.equal(parseDraft(draftJson(), VERDICT).proposal.retargetedFrom, undefined);
 });
 
-test("a declining drafter reply is recognised", () => {
-    assert.equal(looksLikeDraft(JSON.stringify({ decline: true, reason: "no" })), true);
+test("a re-targeted draft without a name fails validation instead of reusing the read-only name", () => {
+    const d = parseDraft(draftJson(), RETARGETED);
+    assert.match(validateProposal(d.proposal, LIMIT), /invalid skill name ""/);
 });
 
-test("a draft is not mistaken for a verdict, and vice versa", () => {
-    // This is the regression that shipped: the early cancel recognised only verdict-shaped
-    // replies, so every drafter ran to completion and the CLI announced it to the main agent.
-    assert.equal(looksLikeVerdict(draftJson()), false);
-    assert.equal(looksLikeDraft(verdictJson()), false);
+// --- personal skills root --------------------------------------------------
+
+const HOME = resolve("fixture-home");
+const skillAt = (source, ...dirs) => ({
+    name: dirs.at(-1),
+    source,
+    path: join(HOME, ...dirs, "SKILL.md"),
 });
 
-test("an unfinished or empty draft is not recognised", () => {
-    assert.equal(looksLikeDraft(""), false);
-    assert.equal(looksLikeDraft("still thinking about it"), false);
-    assert.equal(looksLikeDraft(JSON.stringify({ body: "   " })), false);
-    assert.equal(looksLikeDraft(JSON.stringify({ section: "x" })), false);
-    assert.equal(looksLikeDraft(undefined), false);
+test("the personal root comes from a personal skill, never a repository or plugin one listed first", () => {
+    const fallback = join(HOME, "default-skills");
+    const repo = skillAt("project", "repo", ".github", "skills", "repo-guide");
+    const plugin = skillAt("plugin", "plugins", "skills", "plugin-guide");
+    const custom = skillAt("custom", "custom", "skills", "custom-guide");
+    const copilot = skillAt("personal-copilot", ".copilot", "skills", "copilot-guide");
+    const agents = skillAt("personal-agents", ".agents", "skills", "agents-guide");
+
+    assert.equal(personalSkillsRoot([repo, plugin, custom, copilot, agents], fallback), join(HOME, ".agents", "skills"));
+    assert.equal(personalSkillsRoot([repo, copilot], fallback), join(HOME, ".copilot", "skills"));
+    assert.equal(personalSkillsRoot([repo, plugin, custom], fallback), fallback);
+    assert.equal(personalSkillsRoot([{ name: "x", source: "personal-agents" }], fallback), fallback);
+    assert.equal(personalSkillsRoot([], fallback), fallback);
 });
 
-test("prose around a draft still counts as recognised", () => {
-    assert.equal(looksLikeDraft(`Here you go:\n${draftJson()}\ndone`), true);
+test("only a skill inside the personal root is writable", () => {
+    const root = join(HOME, ".agents", "skills");
+    assert.equal(isInsideRoot(join(root, "mine", "SKILL.md"), root), true);
+    assert.equal(isInsideRoot(join(root, "mine", "SKILL.md"), root + sep), true);
+    assert.equal(isInsideRoot(join(HOME, ".agents", "skills-other", "x", "SKILL.md"), root), false);
+    assert.equal(isInsideRoot(join(HOME, "repo", ".github", "skills", "x", "SKILL.md"), root), false);
+    assert.equal(isInsideRoot(undefined, root), false);
+    assert.equal(isInsideRoot("", root), false);
 });
 
 // --- agent-stop filtering --------------------------------------------------

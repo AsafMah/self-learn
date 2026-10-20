@@ -227,6 +227,21 @@ reviewing or committing would mark them.
   path lies outside the root. Plugin and bundled skills live in caches and install directories that
   updates overwrite, and are never modified. Resolving a refine against the personal root instead
   would silently create a shadow copy competing with the real skill, so neither shortcut is safe.
+- **Skills outside the root are marked `[READ-ONLY]`** in the screener's inventory — a repository's
+  `.github/skills`, plugin and bundled skills — and the screener is told `extend` and `refine` are
+  for unmarked skills only. A verdict that targets one anyway is checked in code before drafting:
+  the lesson is drafted as a **new personal skill** instead, with the read-only skill shown to the
+  drafter for reference. The drafter names it, and a name any listed skill or an existing directory
+  under the root already uses is rejected and retried, so the new skill can neither overwrite the
+  user's own nor shadow the read-only one. The approval dialog says the lesson was re-targeted.
+- When `skillsRoot` is not configured, the root is derived **only from personal skills**: the
+  directory holding a `personal-agents` skill, else a `personal-copilot` one, else `~/.agents/skills`.
+  When both kinds are installed, skills in the other personal directory are outside the root and so
+  read-only too; set `skillsRoot` to choose which one is written.
+  Project, plugin and custom skills never decide it — deriving from whichever skill was listed first
+  once made a repository's `.github/skills` the write root. The runtime has an experimental
+  skill-discovery RPC that reports a preferred creation directory; it is not used while it is
+  experimental.
 - Skill names must match `^[a-z0-9][a-z0-9-]{0,63}$`, which rejects `../`, `..\`, `/`, and `.`;
   the resolved directory is additionally checked to be inside the root.
 - A `refine` or `extend` naming a skill that does not exist is rejected, rather than silently
@@ -239,6 +254,11 @@ reviewing or committing would mark them.
 - Any existing `SKILL.md` is copied to `SKILL.md.bak` before being replaced — keyed on the file
   existing, not on the declared mode, so a `new` proposal colliding with an existing skill is
   still recoverable and is labelled as an overwrite. Supporting files are backed up the same way.
+  A retry after a partly failed write keeps the original backup: each file the draft writes is
+  recorded by content hash (and saved with the pending proposal), so a file still holding the
+  draft's own earlier attempt is not backed up again, and an `extend` is rebuilt from the original
+  in `SKILL.md.bak` instead of appending a second time. A file edited by hand since that attempt
+  no longer matches and is backed up as usual.
 - The approval dialog shows the exact file to be written.
 - The user's hand-written `~/.copilot/copilot-instructions.md` is never touched.
 - Refining a skill that is **disabled** in settings is detected and surfaced in the approval
@@ -249,7 +269,9 @@ reviewing or committing would mark them.
   re-validated (the file is editable on disk) and discarded if older than 12 hours.
 - The proposal is **retained until an explicit decline or a successful write**. A confirm
   exception or a failed write keeps it for another attempt rather than destroying the draft;
-  after 3 failed attempts it is discarded so it cannot re-prompt forever.
+  after 3 failed attempts it is discarded so it cannot re-prompt forever. A dialog nobody answers
+  is not a failed attempt; see
+  [An unanswered dialog must not hold the approval](#an-unanswered-dialog-must-not-hold-the-approval).
 - **The transcript is treated as untrusted input.** Instruction-shaped text inside it is not
   authority. Tool arguments named `prompt` or `message` are redacted — for agent-spawning tools
   (`task`, `write_agent`) their value is literally an instruction to another agent — and the
@@ -360,8 +382,10 @@ additional model calls.
 These are standalone SDK measurements, **not** app-canvas/notification results or a migration of
 production `tasks.startAgent`. That task API does not acquire schema or reasoning-effort fields
 from this experiment. Approval, evidence validation and reviewer policy remain unchanged.
-Background-RPC hook delivery, multi-child races, in-flight tool replacement and attributed
-immediate steering need separate evidence before adoption.
+Hook delivery for RPC-started background agents was measured separately and adopted (see
+[Cancelling the screener](#cancelling-the-screener-to-keep-it-out-of-the-main-agents-context)).
+Multi-child races, in-flight tool replacement and attributed immediate steering still need separate
+evidence before adoption.
 
 ### What the tests are worth, measured
 
@@ -393,7 +417,9 @@ tallied, and nine were real gaps, now closed:
 The tenth is an equivalent mutant: removing the `id === ""` check in `isMainAgentStop` changes no
 behaviour, because the only case where it could decide anything requires an empty main session id,
 which the next line already refuses. Confirmed against 126 input pairs rather than argued.
-The second pass catches **41 of 42**, the exception being that mutant.
+The second pass catches **41 of 42**, the exception being that mutant. Two of those 42 targeted the
+reply recognisers that the `onSubagentStop` hook later made unnecessary, and were removed along with
+that code.
 
 Two things make this measurement lie, and both look exactly like success:
 
@@ -426,7 +452,7 @@ First match wins: `$COPILOT_SELF_LEARN_CONFIG`, `<cwd>/.github/self-learn.json`,
 | `autoScreen` | `false` | Also review automatically at every qualifying yield. Off by default. |
 | `screenOnTaskComplete` | `true` | Review when the agent calls the built-in `task_complete` tool. |
 | `minToolCalls` | `5` | Only used when `autoScreen` is on. |
-| `skillsRoot` | `null` | Skills directory. `null` derives it from the runtime's own skill paths. |
+| `skillsRoot` | `null` | Skills directory. `null` derives it from the runtime's personal skill paths (see Safety). |
 | `maxSkillBytes` | `65536` | Rejects oversized drafts. |
 | `screenerModel` | `gpt-5.6-terra` | Model for stage 1. Should differ from other extensions' models — see below. |
 | `agentType` | `explore` | Built-in agent type. Only `explore`, `task`, `general-purpose`, `rubber-duck`, `code-review`, `research`, `security-review` are dispatchable. **Do not use `rubber-duck`** — see below. |
@@ -434,6 +460,7 @@ First match wins: `$COPILOT_SELF_LEARN_CONFIG`, `<cwd>/.github/self-learn.json`,
 | `maxTranscriptChars` | `120000` | Cap on the transcript sent to the screener. When it binds, the head and tail are kept and the middle is elided. |
 | `maxToolResultChars` | `1200` | Per-tool-result truncation. |
 | `timeoutMs` | `180000` | How long to wait for the screener. |
+| `approvalTimeoutMs` | `1800000` | How long the stop hook waits on an unanswered approval dialog before releasing it and keeping the draft for the next stop. `0` or `null` waits indefinitely. See [An unanswered dialog must not hold the approval](#an-unanswered-dialog-must-not-hold-the-approval). |
 | `logToTimeline` | `true` | Surface hits in the session timeline. |
 | `debugLog` | `~/.copilot/logs/self-learn.log` | Trace file. `null` disables. |
 | `instructions` | `""` | Extra project-specific screening instructions. |
@@ -550,12 +577,15 @@ Nothing here is meant to run for a subtask — the screener reads only main-agen
 the main agent has the context to draft a skill from its own reasoning — so sub-agent calls are
 refused outright.
 
-`ToolInvocation` carries no agent identity (only `sessionId`, `toolCallId`, `toolName`,
-`arguments`), so the caller is resolved through the event log instead: `tool.execution_start` and
-`external_tool.requested` carry an `agentId` that is present for sub-agents and absent for the main
-agent, alongside a `toolCallId` that matches the invocation's.
+The caller is identified from `ToolInvocation.agentId`, which the SDK sets to the calling
+sub-agent's id and leaves empty for the main agent. Measured in an isolated probe (CLI 1.0.99-2):
+a `task`-tool child's call carried its `agentId`, and the main agent's carried `null`. An empty
+value is not treated as proof of the main agent, because a runtime may not populate the field, so
+the event log remains the fallback: `tool.execution_start` and `external_tool.requested` carry an
+`agentId` that is present for sub-agents and absent for the main agent, alongside a `toolCallId`
+that matches the invocation's.
 
-*The ordering is the trap.* The SDK invokes a tool handler from inside its own dispatch of
+*The fallback's ordering is the trap.* The SDK invokes a tool handler from inside its own dispatch of
 `external_tool.requested`, synchronously **before** that event reaches the extension's listeners,
 so a naive lookup always misses. Awaiting a single `setTimeout(…, 0)` lets the listener record the
 call first, which makes the check ordered rather than racy. Verified with a throwaway
@@ -644,8 +674,8 @@ agentDescription="A constructive critic for proposals, designs, …"
 So `model` is the only discriminator available in the event log, which is not enough: the advisor
 extension, this extension, and the main agent's own sub-agents all emit the same events. Matching
 "the first sub-agent started after my baseline" can silently claim another consumer's reply. The
-event-log path is retained only as a fallback and now requires a positive model match rather than
-guessing.
+event-log path is retained only as a last fallback, and matches nothing but the task id this
+extension started.
 
 ## The review hang (CLI regression, worked around)
 
@@ -868,6 +898,40 @@ Note this is the opposite constraint to the review hang above: a **sub-agent** m
 inside a tool handler, while an **elicitation** must be raised inside a live turn. `onAgentStop` is
 the one place measured to permit both.
 
+### An unanswered dialog must not hold the approval
+
+`session.ui.confirm` takes no signal, and the stable SDK offers an extension no way to close an
+open dialog. Awaited without a bound, one unanswered dialog ended self-learn for the rest of a
+session. Measured in session `8282634f`: the main agent called `propose_skill` at 16:45:09, and the
+host gave up on the call at 17:15:09 — exactly 1800 s — failing it with "received no response
+within 1800 seconds". The dialog never settled, so the extension's approval latch stayed set. For
+the next eight days every stop logged "a dialog is already open" and every screening was skipped
+because a proposal was still pending.
+
+So the *wait* for an answer is bounded, not the dialog:
+
+- In `propose_skill`, the wait ends when the tool call's `signal` aborts. The SDK aborts it when
+  the runtime completes the request — including giving up on it, as above — or the session
+  disconnects.
+- In `onAgentStop`, which receives no signal, the wait ends after `approvalTimeoutMs`.
+
+Either way the latch is released and the draft stays pending and persisted, to be offered again
+at the next stop. An unanswered dialog does not count towards the 3-attempt limit.
+
+The old dialog can still be on screen and still be answered:
+
+- A late **Yes** writes the draft if it is still the pending one, even while a newer dialog for
+  the same draft is open. That newer dialog then decides nothing: a Yes there does not write the
+  draft again, and a No there is not recorded as a decline. If the late write fails, the draft
+  stays pending and the newer dialog decides as usual.
+- A late **No** is ignored and the draft is kept. `confirm` returns `false` for a No and a
+  dismissal alike, and recording a dismissal as a decline would suppress the lesson for good. The
+  user declines at the next dialog instead.
+
+**Not verified:** how the app treats a dialog raised inside the turn and answered after it ended.
+Raising one after `turn_end` wedges the app (above); this case has not been observed. A late
+write's `self-learn: wrote …` line is emitted outside a turn and may not be shown.
+
 ## Cancelling the screener to keep it out of the main agent's context
 
 The screener is a real background agent, so the CLI announced each one to the **main** agent as
@@ -884,51 +948,46 @@ if (s.status === "cancelled") { ...; return }              // ← no notificatio
 if (s.factoryRunId === void 0 && !s.activeBlockingReads) { sendBackgroundAgentCompletionNotification(s) }
 ```
 
-`factoryRunId` and `activeBlockingReads` are CLI-internal. Cancellation is not. So the screener is
-now cancelled the moment its verdict is parseable, rather than being left to finish and announce
-itself. Across 61 recorded runs the verdict message precedes `subagent.completed` by 1.6–4.8 s
-(median ~2.0 s), so the window is comfortable rather than a race worth being clever about.
+`factoryRunId` and `activeBlockingReads` are CLI-internal. Cancellation is not, so each screener
+and drafter is cancelled once its reply is in hand, rather than being left to finish and announce
+itself.
 
-**Every sub-agent needs its own recogniser, and forgetting that reintroduces the bug.** Cancelling
-early depends on noticing that the reply has arrived, and "has it arrived" is a question about the
-*shape* of the message. The recogniser was originally hard-coded to the verdict shape. When the
-drafter was added it inherited none of the suppression: its reply is a draft, not a verdict, so it
-was never recognised, never cancelled, and ran to completion — at which point the CLI announced
-"Agent self-learn-1 has finished" to the main agent, which then called `read_agent` and got nothing.
-Observed live at 08:57:33, one turn after the drafter shipped. `runScreener` now takes a `recognise`
-predicate (`looksLikeVerdict` or `looksLikeDraft`), so a new sub-agent cannot silently opt out of
-suppression by having a different reply shape.
+**The reply and the moment to cancel both come from `onSubagentStop`.** The SDK calls this hook
+when a sub-agent ends its turn, with that agent's `agentId` and final `response`, and awaits it
+before the CLI moves on. The extension records each task id `tasks.startAgent` returns, ignores
+stops for any other id, and for its own:
 
-**Identity is the hard part, and cost two failed runs.** There are two id namespaces:
-`startAgent` returns a *task* id derived from `name` (`self-learn-1`), while the event log tags the
-same agent `bg-<uuid>`. They are never equal, and `cancel`/`remove` accept only the former.
-Correlation therefore has to come from the events, and `subagent.started` turned out to carry the
-agent **type's** metadata, not ours:
+1. hands the response to the waiting `runScreener` *before* awaiting anything, so the poll loop
+   never observes the resulting `cancelled` status without the reply;
+2. awaits `tasks.cancel` for exactly that id, inside the hook;
+3. returns `undefined`, leaving the response unmodified.
 
-```
-agentName        = explore
-agentDisplayName = Explore Agent
-agentDescription = Fast codebase exploration and answering questions...
-```
+Measured in an isolated probe (CLI 1.0.99-2, separate `COPILOT_HOME`, three runs): the hook's
+`agentId` equalled the id `startAgent` returned and the `subagent.started` event's id; `response`
+was the agent's final reply; a cancel awaited inside the hook returned `{cancelled: true}`, the task
+was then removable, and no completion notification reached the main agent. In the control run
+without the cancel, an `agent_idle` notification fired and the main agent called `read_agent`.
+The child's own `onAgentStop` fires about 5 ms before `onSubagentStop`, which is why
+`isMainAgentStop` must still filter it.
 
-The `description` passed to `startAgent` appears nowhere in the event, so matching on
-`"Self-learn screening"` could never have worked. (The same dead match exists in
-`readReplyFromEventLog`, which has always fallen through to its model check.) What remains —
-`agentName` and `model` — is shared with the main agent's own `explore` sub-agents, and latching
-onto a stranger would cancel our screener early and read someone else's message as the verdict.
+**This replaced recognising the reply in the event stream.** The previous design watched
+`assistant.message` events and cancelled the moment a message had the expected shape. It needed a
+recogniser per reply shape — the drafter shipped without one, ran to completion and was announced
+to the main agent — and it needed identity, which it could only get by matching the sub-agent's
+first `user.message` against the head of the prompt just sent, because older runtimes named the
+task `self-learn-1` and the event-stream agent `bg-<uuid>`. The hook supplies identity and reply
+directly, so neither the recognisers nor the prompt match remain.
 
-The prompt is the one field only this extension could have produced, so identity comes from the
-sub-agent's first `user.message` matching the head of the prompt just sent.
+**Runtimes without the hook still get their reply, but not the suppression.** If the hook never
+fires, `runScreener` polls the task: `latestResponse` first, then the event log keyed by the task
+id. The event-log fallback finds nothing on a runtime whose event ids differ from task ids; there,
+`latestResponse` is what answers. Nothing cancels such a task before it finishes, so each screening
+there costs one completion notification.
 
 **Losing the race must stay harmless.** If completion wins, cancelling returns `{cancelled: false}`
 and removal is skipped, because removal is exactly what invalidated the notification's attached
 read in the first place. A lost race degrades to the old behaviour — one stray notification — not
 to an error.
-
-Verified live: `screener event id bg-ad286f0f-… (task id self-learn-1)` followed by `screener
-cancelled on verdict (notification suppressed)`, and no completion notification reached the main
-agent on that turn.
-
 ## Known limitations
 
 - **Contention with `advisor`.** `session.idle` is deferred while background work is pending. An
@@ -941,8 +1000,9 @@ agent on that turn.
   ask for**. Deferring the approval dialog does not hide that.
 - `startAgent` accepts a `model` but no reasoning-effort override, so the screener runs at its
   model's default effort.
-- A screening whose verdict arrives too late to cancel still emits one "agent finished"
-  notification into the main agent's context.
+- A screening the extension cannot cancel before it completes still emits one "agent finished"
+  notification into the main agent's context: on a runtime without the `onSubagentStop` hook, every
+  screening does; with it, only one whose cancel loses to completion.
 - The extension loads per session, so several sessions screen independently.
 - **Extension slash commands do not appear in the GitHub Copilot app**, only in the CLI's TUI.
   The `self_learn_now` tool exists to cover that gap.

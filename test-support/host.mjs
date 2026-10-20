@@ -13,11 +13,15 @@ registerHooks({
     },
 });
 
-export async function boot(t, { pendingProposal } = {}) {
+export async function boot(t, { pendingProposal, config = {} } = {}) {
     const root = mkdtempSync(join(tmpdir(), "self-learn-host-"));
     const oldConfig = process.env.COPILOT_SELF_LEARN_CONFIG;
+    // The decline ledger and instruction files resolve under the home directory at import time.
+    const oldHome = { USERPROFILE: process.env.USERPROFILE, HOME: process.env.HOME };
+    process.env.USERPROFILE = root;
+    process.env.HOME = root;
     const configPath = join(root, "config.json");
-    writeFileSync(configPath, JSON.stringify({ autoScreen: false, debugLog: join(root, "debug.log") }));
+    writeFileSync(configPath, JSON.stringify({ autoScreen: false, debugLog: join(root, "debug.log"), ...config }));
     process.env.COPILOT_SELF_LEARN_CONFIG = configPath;
     if (pendingProposal) {
         mkdirSync(join(root, "files"));
@@ -28,9 +32,38 @@ export async function boot(t, { pendingProposal } = {}) {
     const logs = [];
     const host = {
         root, logs, confirmations: [], confirmationResult: true,
+        events: [], skills: [], tasks: new Map(), rpcCalls: [], onStartAgent: null,
         session: {
             sessionId: randomUUID(),
             workspacePath: root,
+            getEvents: async () => host.events.slice(),
+            rpc: {
+                skills: {
+                    list: async () => ({ skills: host.skills.map((skill) => ({ ...skill })) }),
+                    reload: async () => { host.rpcCalls.push(["skills.reload"]); },
+                },
+                tasks: {
+                    async startAgent(request) {
+                        const agentId = randomUUID();
+                        host.tasks.set(agentId, { id: agentId, status: "running" });
+                        host.rpcCalls.push(["tasks.startAgent", agentId, request]);
+                        if (host.onStartAgent) setImmediate(() => host.onStartAgent(agentId, request));
+                        return { agentId };
+                    },
+                    list: async () => ({ tasks: [...host.tasks.values()].map((task) => ({ ...task })) }),
+                    async cancel({ id }) {
+                        host.rpcCalls.push(["tasks.cancel", id]);
+                        const task = host.tasks.get(id);
+                        if (task?.status !== "running") return { cancelled: false };
+                        task.status = "cancelled";
+                        return { cancelled: true };
+                    },
+                    async remove({ id }) {
+                        host.rpcCalls.push(["tasks.remove", id]);
+                        return { removed: host.tasks.delete(id) };
+                    },
+                },
+            },
             on(type, handler) {
                 const fn = typeof type === "function" ? type : (event) => {
                     if (event.type === type) return handler(event);
@@ -63,6 +96,17 @@ export async function boot(t, { pendingProposal } = {}) {
         tool(action, invocation = {}) {
             return host.options.tools.find((tool) => tool.name === "self_learn_now").handler({ action }, invocation);
         },
+        // Shaped like the measured hook input: ids are the parent's, and the agent id is the task id.
+        stopSubagent(agentId, response) {
+            const sessionId = host.session.sessionId;
+            return host.options.hooks.onSubagentStop?.({
+                sessionId, agentId, agentName: "explore", agentType: "explore",
+                stopReason: "end_turn", response, timestamp: Date.now(),
+            }, { sessionId });
+        },
+        command(name) {
+            return host.options.commands.find((command) => command.name === name).handler();
+        },
     };
     globalThis[Symbol.for("self-learn-test-host")] = host;
     t.after(async () => {
@@ -71,6 +115,10 @@ export async function boot(t, { pendingProposal } = {}) {
         }
         if (oldConfig === undefined) delete process.env.COPILOT_SELF_LEARN_CONFIG;
         else process.env.COPILOT_SELF_LEARN_CONFIG = oldConfig;
+        for (const [key, value] of Object.entries(oldHome)) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
         delete globalThis[Symbol.for("self-learn-test-host")];
         rmSync(root, { recursive: true, force: true });
     });
