@@ -262,7 +262,9 @@ reviewing or committing would mark them.
   re-validated (the file is editable on disk) and discarded if older than 12 hours.
 - The proposal is **retained until an explicit decline or a successful write**. A confirm
   exception or a failed write keeps it for another attempt rather than destroying the draft;
-  after 3 failed attempts it is discarded so it cannot re-prompt forever.
+  after 3 failed attempts it is discarded so it cannot re-prompt forever. A dialog nobody answers
+  is not a failed attempt; see
+  [An unanswered dialog must not hold the approval](#an-unanswered-dialog-must-not-hold-the-approval).
 - **The transcript is treated as untrusted input.** Instruction-shaped text inside it is not
   authority. Tool arguments named `prompt` or `message` are redacted — for agent-spawning tools
   (`task`, `write_agent`) their value is literally an instruction to another agent — and the
@@ -451,6 +453,7 @@ First match wins: `$COPILOT_SELF_LEARN_CONFIG`, `<cwd>/.github/self-learn.json`,
 | `maxTranscriptChars` | `120000` | Cap on the transcript sent to the screener. When it binds, the head and tail are kept and the middle is elided. |
 | `maxToolResultChars` | `1200` | Per-tool-result truncation. |
 | `timeoutMs` | `180000` | How long to wait for the screener. |
+| `approvalTimeoutMs` | `1800000` | How long the stop hook waits on an unanswered approval dialog before releasing it and keeping the draft for the next stop. `0` or `null` waits indefinitely. See [An unanswered dialog must not hold the approval](#an-unanswered-dialog-must-not-hold-the-approval). |
 | `logToTimeline` | `true` | Surface hits in the session timeline. |
 | `debugLog` | `~/.copilot/logs/self-learn.log` | Trace file. `null` disables. |
 | `instructions` | `""` | Extra project-specific screening instructions. |
@@ -887,6 +890,38 @@ reload is therefore shown at the next `onAgentStop`, not immediately.
 Note this is the opposite constraint to the review hang above: a **sub-agent** must not be started
 inside a tool handler, while an **elicitation** must be raised inside a live turn. `onAgentStop` is
 the one place measured to permit both.
+
+### An unanswered dialog must not hold the approval
+
+`session.ui.confirm` takes no signal, and the stable SDK offers an extension no way to close an
+open dialog. Awaited without a bound, one unanswered dialog ended self-learn for the rest of a
+session. Measured in session `8282634f`: the main agent called `propose_skill` at 16:45:09, and the
+host gave up on the call at 17:15:09 — exactly 1800 s — failing it with "received no response
+within 1800 seconds". The dialog never settled, so the extension's approval latch stayed set. For
+the next eight days every stop logged "a dialog is already open" and every screening was skipped
+because a proposal was still pending.
+
+So the *wait* for an answer is bounded, not the dialog:
+
+- In `propose_skill`, the wait ends when the tool call's `signal` aborts. The SDK aborts it when
+  the runtime completes the request — including giving up on it, as above — or the session
+  disconnects.
+- In `onAgentStop`, which receives no signal, the wait ends after `approvalTimeoutMs`.
+
+Either way the latch is released and the draft stays pending and persisted, to be offered again
+at the next stop. An unanswered dialog does not count towards the 3-attempt limit.
+
+The old dialog can still be on screen and still be answered:
+
+- A late **Yes** writes the draft, provided it is still the pending one and no other approval
+  dialog is open — an open one decides instead.
+- A late **No** is ignored and the draft is kept. `confirm` returns `false` for a No and a
+  dismissal alike, and recording a dismissal as a decline would suppress the lesson for good. The
+  user declines at the next dialog instead.
+
+**Not verified:** how the app treats a dialog raised inside the turn and answered after it ended.
+Raising one after `turn_end` wedges the app (above); this case has not been observed. A late
+write's `self-learn: wrote …` line is emitted outside a turn and may not be shown.
 
 ## Cancelling the screener to keep it out of the main agent's context
 

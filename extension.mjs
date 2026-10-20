@@ -60,6 +60,10 @@ const DEFAULTS = {
     maxTranscriptChars: 120000,
     maxToolResultChars: 1200,
     timeoutMs: 180000,
+    // An approval dialog nobody answers must not hold the approval open forever. A tool call's
+    // wait ends when the host abandons the call; the stop hook has no such signal, so its wait
+    // ends after this long instead. 0 or null waits indefinitely.
+    approvalTimeoutMs: 30 * 60 * 1000,
     pollIntervalMs: 2000,
     logToTimeline: true,
     debugLog: join(homedir(), ".copilot", "logs", "self-learn.log"),
@@ -1204,8 +1208,10 @@ async function screenAndDraft(session, opts = {}) {
 // Owns `state.resolvingProposal` itself, including clearing it: callers must not set that flag
 // before calling, or the guard below fires and the dialog never opens.
 //
+// `signal` is the tool call's, when the dialog is raised from one; see `awaitAnswer`.
+//
 // Returns what happened, so the caller can report it.
-async function resolvePendingProposal(session) {
+async function resolvePendingProposal(session, { signal } = {}) {
     const p = state.pendingProposal;
     if (!p || p.deferred) return "none";
 
@@ -1231,11 +1237,7 @@ async function resolvePendingProposal(session) {
     }
     persistPendingProposal(session);
 
-    const discard = (reason) => {
-        state.pendingProposal = null;
-        persistPendingProposal(session);
-        debug(`proposal "${p.name}" discarded: ${reason}`);
-    };
+    const discard = (reason) => discardProposal(session, p, reason);
 
     try {
         // Label from what is actually on disk, not from the declared mode, so a "new" proposal
@@ -1323,9 +1325,9 @@ take effect until you re-enable it.`
 ${heading}${closeOpenFence(truncate(p.body, 800))}\
 ${filesNote}${backupNote}${pathNote}${disabledNote}\n\nWrite it?`;
 
-        let approved = false;
+        let reply;
         try {
-            approved = await session.ui.confirm(message);
+            reply = await awaitAnswer(session, message, signal);
         } catch (err) {
             // Kept for another attempt: the host may not have been ready to show a dialog.
             state.lastError = `confirm failed: ${err?.message ?? err}`;
@@ -1333,30 +1335,118 @@ ${filesNote}${backupNote}${pathNote}${disabledNote}\n\nWrite it?`;
             return "retained";
         }
 
-        if (!approved) {
+        if (reply.ended) {
+            // Not counted against the attempt limit: an unanswered dialog says nothing about the
+            // draft, and counting it would discard a good one after a few unattended stops.
+            p.attempts -= 1;
+            if (state.pendingProposal === p) persistPendingProposal(session);
+            state.lastError = `approval dialog ${reply.ended}`;
+            debug(`proposal "${p.name}" kept: ${state.lastError}`);
+            reply.answer.then(
+                (approved) => answeredLate(session, p, approved),
+                (err) => debug(`proposal "${p.name}": expired approval dialog failed: ${err?.message ?? err}`),
+            );
+            return "retained";
+        }
+
+        if (!reply.approved) {
             recordDecline({ name: p.name, why: p.why, by: "user" });
             discard("declined by user");
             await say(`self-learn: discarded proposal for "${p.name}"`);
             return "declined";
         }
 
-        let outcome = "written";
-        try {
-            const file = await writeSkill(session, p);
-            discard("written");
-            state.written++;
-            await say(`self-learn: wrote ${file}`);
-        } catch (err) {
-            // Kept so a transient failure (locked file, transient FS error) can be retried.
-            state.lastError = `write failed: ${err?.message ?? err}`;
-            debug(`${state.lastError} — proposal "${p.name}" retained for retry`);
-            await say(`self-learn: write failed, proposal kept — ${state.lastError}`);
-            outcome = "retained";
-        }
-        return outcome;
+        return await writeApproved(session, p);
     } finally {
         state.resolvingProposal = false;
     }
+}
+
+// `session.ui.confirm` takes no signal, and only an experimental RPC can close an open dialog, so
+// nothing here ends a dialog — only the wait for it. Unbounded, that wait held the approval latch
+// for eight days in session 8282634f: the host gave up on the `propose_skill` call after exactly
+// 1800s and aborted its signal, the dialog never settled, and every later stop was skipped as "a
+// dialog is already open". A tool call's wait now ends with its signal; the stop hook has none, so
+// its wait ends after `approvalTimeoutMs`. The dialog may still be answered afterwards, so the
+// answer is handed back for `answeredLate`.
+async function awaitAnswer(session, message, signal) {
+    const answer = session.ui.confirm(message);
+    let release = () => {};
+    const ended = new Promise((resolve) => {
+        if (signal) {
+            const onAbort = () => resolve("abandoned when its tool call ended");
+            if (signal.aborted) return onAbort();
+            signal.addEventListener("abort", onAbort, { once: true });
+            release = () => signal.removeEventListener("abort", onAbort);
+            return;
+        }
+        // Node runs a delay above 2^31-1 ms after 1 ms, which would turn a long timeout into none.
+        const timeoutMs = Math.min(cfg("approvalTimeoutMs"), 2 ** 31 - 1);
+        if (!(timeoutMs > 0)) return;
+        const timer = setTimeout(() => resolve(`timed out after ${timeoutMs}ms`), timeoutMs);
+        timer.unref?.();
+        release = () => clearTimeout(timer);
+    });
+    try {
+        return await Promise.race([
+            answer.then((approved) => ({ approved })),
+            ended.then((reason) => ({ ended: reason, answer })),
+        ]);
+    } finally {
+        release();
+    }
+}
+
+// An answer to a dialog whose wait already ended. A Yes is still the user's approval of exactly
+// this draft, so it is written while that draft is the pending one — unless another approval of
+// it is open, which then decides instead. Anything else is ignored and the draft is offered again
+// at the next stop: `confirm` reports a No and a dismissal alike as false, so a late false cannot
+// be told apart from the dialog simply being closed.
+async function answeredLate(session, p, approved) {
+    if (approved !== true) {
+        debug(`proposal "${p.name}": late No or dismissal of an expired dialog ignored; kept`);
+        return;
+    }
+    if (state.pendingProposal !== p || state.resolvingProposal) {
+        const why = state.pendingProposal !== p ? "it is no longer pending" : "another approval is open";
+        debug(`proposal "${p.name}": late approval ignored, ${why}`);
+        return;
+    }
+    state.resolvingProposal = true;
+    try {
+        debug(`proposal "${p.name}" approved late, on an expired dialog`);
+        await writeApproved(session, p);
+    } catch (err) {
+        debug(`proposal "${p.name}": late approval failed: ${err?.message ?? err}`);
+    } finally {
+        state.resolvingProposal = false;
+    }
+}
+
+async function writeApproved(session, p) {
+    try {
+        const file = await writeSkill(session, p);
+        discardProposal(session, p, "written");
+        state.written++;
+        await say(`self-learn: wrote ${file}`);
+        return "written";
+    } catch (err) {
+        // Kept so a transient failure (locked file, transient FS error) can be retried.
+        state.lastError = `write failed: ${err?.message ?? err}`;
+        debug(`${state.lastError} — proposal "${p.name}" retained for retry`);
+        await say(`self-learn: write failed, proposal kept — ${state.lastError}`);
+        return "retained";
+    }
+}
+
+// Clears `p` only if it is still the pending proposal: a dialog can outlive the proposal it
+// showed, and clearing unconditionally would destroy whichever draft replaced it.
+function discardProposal(session, p, reason) {
+    if (state.pendingProposal === p) {
+        state.pendingProposal = null;
+        persistPendingProposal(session);
+    }
+    debug(`proposal "${p.name}" discarded: ${reason}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -1887,7 +1977,8 @@ const session = await joinSession({
                 // Confirmed here, inside the open tool call, rather than at idle. The dialog then
                 // belongs to a turn the host can finish; raised after the turn ended, the approval
                 // resolved and the write succeeded but the app stayed stuck showing "running".
-                const outcome = await resolvePendingProposal(session);
+                // The call's signal ends the wait if the host gives up on the call first.
+                const outcome = await resolvePendingProposal(session, { signal: invocation?.signal });
                 switch (outcome) {
                     case "written":
                         return `Approved and written. Tell the user the skill "${proposal.name}" was saved.`;
@@ -1943,6 +2034,7 @@ const session = await joinSession({
             }
             if (!state.pendingProposal || state.pendingProposal.deferred) return;
 
+            // Bounded by `approvalTimeoutMs`: this hook has no signal to end the wait otherwise.
             try {
                 const outcome = await resolvePendingProposal(session);
                 debug(`agentStop: proposal resolved -> ${outcome}`);

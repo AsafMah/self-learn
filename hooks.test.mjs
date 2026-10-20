@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { boot } from "./test-support/host.mjs";
 
 test("review and status are preloaded without changing scheduling or other tools", async (t) => {
@@ -306,6 +307,154 @@ test("an extend naming no installed skill is still refused rather than re-target
     await host.command("learn-now");
     assert.equal(prompts.length, 1);
     assert.match(host.logs.at(-1), /could not draft it \("ghost-skill" could not be read/);
+});
+
+const PENDING_LESSON = {
+    mode: "new", name: "test-lesson", description: "A fixture lesson description",
+    body: "A fixture body with enough detail for the proposal validator.", why: "Fixture evidence",
+};
+
+// Each dialog stays open until the test answers it, as an unattended App dialog does.
+function holdDialogs(host) {
+    const answers = [];
+    host.confirmationHandler = () => new Promise((resolve) => answers.push(resolve));
+    return answers;
+}
+
+async function until(condition, what) {
+    for (let i = 0; i < 500 && !condition(); i++) await delay(2);
+    assert.ok(condition(), `timed out waiting for ${what}`);
+}
+
+const statusOf = (host) => host.options.canvases[0].actions[0].handler().status;
+const lessonFile = (host, name) => join(host.root, ...AGENTS_SKILLS, name, "SKILL.md");
+const declineLedger = (host) => join(host.root, ".copilot", "self-learn", "declined.json");
+
+// Distinguishes a stop hook that returned from one still waiting on a dialog nobody answers.
+const settles = (promise) => Promise.race([promise.then(() => "returned"), delay(2000).then(() => "still waiting")]);
+
+test("a dialog abandoned with its tool call releases the approval and keeps the draft for the next stop", async (t) => {
+    const host = await boot(t);
+    const answers = holdDialogs(host);
+    const propose = host.options.tools.find((tool) => tool.name === "propose_skill");
+    const call = new AbortController();
+    const result = propose.handler(
+        { mode: "new", name: "fresh-lesson", description: "Fixture lesson", body: "Fixture body" },
+        { signal: call.signal });
+    await until(() => answers.length === 1, "the approval dialog");
+    assert.equal(statusOf(host).phase, "Approval in progress");
+
+    call.abort();
+    assert.equal(await settles(result), "returned");
+    assert.match(await result, /approval could not be completed now \(approval dialog abandoned.*\)\. The user will be asked again/);
+    assert.equal(statusOf(host).phase, "Proposal pending");
+    assert.equal(savedProposal(host).attempts ?? 0, 0);
+
+    const stop = mainStop(host);
+    await until(() => answers.length === 2, "the draft to be offered again at the next stop");
+    answers[1](true);
+    await stop;
+    assert.equal(statusOf(host).written, 1);
+    assert.ok(existsSync(lessonFile(host, "fresh-lesson")));
+
+    answers[0](true);
+    await delay(20);
+    assert.equal(statusOf(host).written, 1, "a late answer to the abandoned dialog writes nothing twice");
+});
+
+test("a stop-hook dialog times out; a late No keeps the draft and a late Yes writes it", async (t) => {
+    const host = await boot(t, { pendingProposal: PENDING_LESSON, config: { approvalTimeoutMs: 30 } });
+    const answers = holdDialogs(host);
+
+    assert.equal(await settles(mainStop(host)), "returned");
+    assert.equal(answers.length, 1);
+    assert.equal(statusOf(host).phase, "Proposal pending");
+    assert.match(statusOf(host).lastError, /approval dialog timed out after 30ms/);
+    assert.equal(savedProposal(host).attempts ?? 0, 0);
+
+    answers[0](false);
+    await delay(20);
+    assert.equal(statusOf(host).pending?.name, "test-lesson", "a late No or dismissal discards nothing");
+    assert.equal(existsSync(declineLedger(host)), false, "a late No is not recorded as a decline");
+
+    assert.equal(await settles(mainStop(host)), "returned");
+    assert.equal(answers.length, 2, "the next stop offers the draft again");
+    answers[1](true);
+    await until(() => statusOf(host).written === 1, "the late approval to be written");
+    assert.ok(existsSync(lessonFile(host, "test-lesson")));
+    assert.equal(statusOf(host).pending, null);
+});
+
+test("a late Yes for a superseded draft writes nothing and leaves the newer draft pending", async (t) => {
+    const host = await boot(t, { pendingProposal: PENDING_LESSON, config: { approvalTimeoutMs: 30 } });
+    const answers = holdDialogs(host);
+    assert.equal(await settles(mainStop(host)), "returned");
+
+    const propose = host.options.tools.find((tool) => tool.name === "propose_skill");
+    const call = new AbortController();
+    const result = propose.handler(
+        { mode: "new", name: "newer-lesson", description: "Newer fixture lesson", body: "Newer body" },
+        { signal: call.signal });
+    await until(() => answers.length === 2, "the newer draft's dialog");
+    call.abort();
+    await result;
+
+    answers[0](true);
+    await delay(20);
+    assert.equal(existsSync(lessonFile(host, "test-lesson")), false);
+    assert.equal(statusOf(host).written, 0);
+    assert.equal(statusOf(host).pending?.name, "newer-lesson");
+});
+
+test("a draft submitted while another's dialog is open survives that dialog's approval", async (t) => {
+    const host = await boot(t);
+    const answers = holdDialogs(host);
+    const propose = host.options.tools.find((tool) => tool.name === "propose_skill");
+    const first = propose.handler(
+        { mode: "new", name: "first-lesson", description: "First fixture lesson", body: "First body" }, {});
+    await until(() => answers.length === 1, "the first dialog");
+    assert.match(await propose.handler(
+        { mode: "new", name: "second-lesson", description: "Second fixture lesson", body: "Second body" }, {}),
+    /The user will be asked again/);
+
+    answers[0](true);
+    assert.match(await first, /Approved and written/);
+    assert.ok(existsSync(lessonFile(host, "first-lesson")));
+    assert.equal(statusOf(host).pending?.name, "second-lesson");
+    assert.equal(savedProposal(host).name, "second-lesson");
+});
+
+test("an approval timeout too long for a timer still waits instead of ending at once", async (t) => {
+    // Node runs any delay above 2^31-1 ms after 1 ms, so ~35 days would otherwise mean no wait.
+    const host = await boot(t, { pendingProposal: PENDING_LESSON, config: { approvalTimeoutMs: 3e9 } });
+    const answers = holdDialogs(host);
+    const stop = mainStop(host);
+    await until(() => answers.length === 1, "the approval dialog");
+    assert.equal(await Promise.race([stop.then(() => "returned"), delay(200).then(() => "still waiting")]),
+        "still waiting");
+    answers[0](true);
+    await stop;
+    assert.equal(statusOf(host).written, 1);
+});
+
+test("a late Yes defers to an approval dialog open for the same draft", async (t) => {
+    // Long enough for the second dialog to still be open when the first is answered.
+    const host = await boot(t, { pendingProposal: PENDING_LESSON, config: { approvalTimeoutMs: 1000 } });
+    const answers = holdDialogs(host);
+    assert.equal(await settles(mainStop(host)), "returned");
+
+    const second = mainStop(host);
+    await until(() => answers.length === 2, "the second dialog");
+    answers[0](true);
+    await delay(20);
+    assert.equal(statusOf(host).written, 0, "the open dialog decides, not the stale one");
+    assert.equal(statusOf(host).phase, "Approval in progress");
+
+    answers[1](false);
+    await second;
+    assert.equal(statusOf(host).written, 0);
+    assert.equal(statusOf(host).pending, null);
+    assert.ok(existsSync(declineLedger(host)));
 });
 
 test("declined and unavailable control confirmations do not change settings", async (t) => {
