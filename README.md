@@ -991,8 +991,9 @@ to an error.
   ask for**. Deferring the approval dialog does not hide that.
 - `startAgent` accepts a `model` but no reasoning-effort override, so the screener runs at its
   model's default effort.
-- A screening whose verdict arrives too late to cancel still emits one "agent finished"
-  notification into the main agent's context.
+- A screening the extension cannot cancel before it completes still emits one "agent finished"
+  notification into the main agent's context: on a runtime without the `onSubagentStop` hook, every
+  screening does; with it, only one whose cancel loses to completion.
 - The extension loads per session, so several sessions screen independently.
 - **Extension slash commands do not appear in the GitHub Copilot app**, only in the CLI's TUI.
   The `self_learn_now` tool exists to cover that gap.
