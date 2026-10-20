@@ -12,7 +12,10 @@ import {
     parseDraft,
     isMainAgentStop,
     extractJsonObjects,
+    personalSkillsRoot,
+    isInsideRoot,
 } from "./lib.mjs";
+import { join, resolve, sep } from "node:path";
 
 const LIMIT = 65536;
 
@@ -425,6 +428,60 @@ test("an over-long section is left long enough to fail validation rather than tr
         /section/,
         "an over-long section must be reported, not silently truncated into a passing one",
     );
+});
+
+const RETARGETED = {
+    target: "new",
+    skill: "repo-guide",
+    rationale: "because",
+    retargetedFrom: { skill: "repo-guide", target: "extend" },
+};
+
+test("a draft re-targeted away from a read-only skill is named by the drafter", () => {
+    const d = parseDraft(draftJson({ mode: "extend", name: "lockfile-cache-keys" }), RETARGETED);
+    assert.equal(d.proposal.mode, "new");
+    assert.equal(d.proposal.name, "lockfile-cache-keys");
+    assert.deepEqual(d.proposal.retargetedFrom, { skill: "repo-guide", target: "extend" });
+    assert.equal(parseDraft(draftJson(), VERDICT).proposal.retargetedFrom, undefined);
+});
+
+test("a re-targeted draft without a name fails validation instead of reusing the read-only name", () => {
+    const d = parseDraft(draftJson(), RETARGETED);
+    assert.match(validateProposal(d.proposal, LIMIT), /invalid skill name ""/);
+});
+
+// --- personal skills root --------------------------------------------------
+
+const HOME = resolve("fixture-home");
+const skillAt = (source, ...dirs) => ({
+    name: dirs.at(-1),
+    source,
+    path: join(HOME, ...dirs, "SKILL.md"),
+});
+
+test("the personal root comes from a personal skill, never a repository or plugin one listed first", () => {
+    const fallback = join(HOME, "default-skills");
+    const repo = skillAt("project", "repo", ".github", "skills", "repo-guide");
+    const plugin = skillAt("plugin", "plugins", "skills", "plugin-guide");
+    const custom = skillAt("custom", "custom", "skills", "custom-guide");
+    const copilot = skillAt("personal-copilot", ".copilot", "skills", "copilot-guide");
+    const agents = skillAt("personal-agents", ".agents", "skills", "agents-guide");
+
+    assert.equal(personalSkillsRoot([repo, plugin, custom, copilot, agents], fallback), join(HOME, ".agents", "skills"));
+    assert.equal(personalSkillsRoot([repo, copilot], fallback), join(HOME, ".copilot", "skills"));
+    assert.equal(personalSkillsRoot([repo, plugin, custom], fallback), fallback);
+    assert.equal(personalSkillsRoot([{ name: "x", source: "personal-agents" }], fallback), fallback);
+    assert.equal(personalSkillsRoot([], fallback), fallback);
+});
+
+test("only a skill inside the personal root is writable", () => {
+    const root = join(HOME, ".agents", "skills");
+    assert.equal(isInsideRoot(join(root, "mine", "SKILL.md"), root), true);
+    assert.equal(isInsideRoot(join(root, "mine", "SKILL.md"), root + sep), true);
+    assert.equal(isInsideRoot(join(HOME, ".agents", "skills-other", "x", "SKILL.md"), root), false);
+    assert.equal(isInsideRoot(join(HOME, "repo", ".github", "skills", "x", "SKILL.md"), root), false);
+    assert.equal(isInsideRoot(undefined, root), false);
+    assert.equal(isInsideRoot("", root), false);
 });
 
 // --- agent-stop filtering --------------------------------------------------

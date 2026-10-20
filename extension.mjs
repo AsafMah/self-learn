@@ -30,6 +30,8 @@ import {
     appendSection,
     parseDraft,
     isMainAgentStop,
+    personalSkillsRoot,
+    isInsideRoot,
 } from "./lib.mjs";
 
 const DEFAULTS = {
@@ -421,10 +423,12 @@ async function listSkills(session) {
     try {
         const { skills } = await session.rpc.skills.list();
         const referenced = loadInstructionSkillNames(skills.map((s) => s.name));
+        const root = skillsRootFrom(skills);
         return skills.map((s) => ({
             name: s.name,
             description: s.description,
             referenced: referenced.has(s.name),
+            readOnly: !isInsideRoot(s.path, root),
         }));
     } catch (err) {
         debug(`skills.list failed: ${err?.message ?? err}`);
@@ -438,7 +442,8 @@ function buildScreenerPrompt(transcript, skills, declined = []) {
             ? skills
                   .map(
                       (s) =>
-                          `- ${s.name}${s.referenced ? " [IN USER'S INSTRUCTIONS]" : ""}: ${s.description ?? ""}`,
+                          `- ${s.name}${s.readOnly ? " [READ-ONLY]" : ""}` +
+                          `${s.referenced ? " [IN USER'S INSTRUCTIONS]" : ""}: ${s.description ?? ""}`,
                   )
                   .join("\n")
             : "(no skills installed)";
@@ -544,6 +549,9 @@ Respond with EXACTLY ONE JSON object and nothing else:
     since it rewrites the whole skill.
   - "new" — no skill above owns the subject. Give a short kebab-case name.
   Merely adjacent is not enough: mistargeting corrupts an unrelated skill.
+- Skills marked [READ-ONLY] belong to a repository, a plugin or the runtime, and cannot be changed
+  here. "extend" and "refine" are for unmarked skills only: a lesson in a read-only skill's subject
+  is "new", with its own name. This overrides the [IN USER'S INSTRUCTIONS] preference below.
 - Skills marked [IN USER'S INSTRUCTIONS] are named in the user's own instruction files, so the
   agent is told they exist in every session. Unmarked skills are surfaced only when the runtime
   judges them relevant, and a narrowly-scoped new skill is often never surfaced at all — measured
@@ -836,20 +844,22 @@ async function screen(session, { force = false, lookback = 0 } = {}) {
 // Stage 2/3: escalation, approval, and writing
 // ---------------------------------------------------------------------------
 
-// Derive the skills directory from the runtime's own reported paths rather than hardcoding it,
-// falling back to the documented personal location.
-async function resolveSkillsRoot(session) {
+// The one directory self-learn writes skills into. Unless configured, it is derived from where the
+// runtime reports the user's own skills, falling back to the documented personal location.
+function skillsRootFrom(skills) {
     const configured = cfg("skillsRoot");
     if (configured) return resolve(configured);
+    return personalSkillsRoot(skills, join(homedir(), ".agents", "skills"));
+}
 
+async function resolveSkillsRoot(session) {
+    if (cfg("skillsRoot")) return skillsRootFrom([]);
     try {
         const { skills } = await session.rpc.skills.list();
-        const sample = skills.find((s) => s.path && s.source !== "plugin");
-        if (sample) return resolve(dirname(dirname(sample.path)));
+        return skillsRootFrom(skills);
     } catch {
-        // Fall through to the default.
+        return skillsRootFrom([]);
     }
-    return join(homedir(), ".agents", "skills");
 }
 
 // Resolves a skill's file path, enforcing that writes stay inside the user's personal skills root.
@@ -980,8 +990,16 @@ async function readExistingSkill(session, name, mode) {
 }
 
 function buildDrafterPrompt(verdict, transcript, existing) {
+    const retarget = verdict.retargetedFrom;
     let target;
-    if (verdict.target === "extend") {
+    if (retarget) {
+        const correcting = retarget.target === "refine";
+        target = `This lesson was meant to ${correcting ? "correct" : "extend"} the skill \
+"${retarget.skill}", but that skill belongs to a repository, a plugin or the runtime and cannot be \
+changed here. Write it as a NEW personal skill that stands on its own\
+${correcting ? `, stating the correction to what "${retarget.skill}" says` : ""}. Give it a short \
+kebab-case "name" that is not "${retarget.skill}" and not the name of any other existing skill.`;
+    } else if (verdict.target === "extend") {
         target = `Add to the existing skill "${verdict.skill}". Write ONLY the new section: the \
 extension appends it verbatim and never rewrites what is already there, so do NOT reproduce any \
 existing content. Put a short title in "section", and just that section's text in "body". Supply \
@@ -995,9 +1013,13 @@ wrong, not for adding a case it simply does not cover.`;
         target = `Create a new skill named "${verdict.skill}".`;
     }
 
-    const current = existing
-        ? `\n\nThe skill as it stands today:\n\n<current_skill>\n${truncate(existing, EXISTING_SKILL_BUDGET)}\n</current_skill>`
-        : "";
+    const current = !existing
+        ? ""
+        : retarget
+          ? `\n\nThe read-only skill "${retarget.skill}", for reference — do not repeat what it \
+already says:\n\n<current_skill>\n${truncate(existing, EXISTING_SKILL_BUDGET)}\n</current_skill>`
+          : `\n\nThe skill as it stands today:\n\n<current_skill>\n${truncate(existing, EXISTING_SKILL_BUDGET)}\n</current_skill>`;
+    const nameField = retarget ? `\n  "name": "kebab-case-name",` : "";
 
     return `You are drafting a reusable skill file from the transcript of a coding session. A \
 reviewer model has already judged that this session contains a durable, reusable lesson; your job \
@@ -1019,7 +1041,7 @@ none, because it will be trusted.
 
 Reply with ONE JSON object and nothing else:
 
-{
+{${nameField}
   "description": "one line saying when a future agent should load this skill",
   "section": "short plain-text title, 3-80 chars (mode extend only)",
   "body": "the markdown body",
@@ -1036,6 +1058,39 @@ ${transcript}
 
 // Returns { proposal }, { decline, reason }, or { error }.
 async function draft(session, verdict, transcript) {
+    let skills = [];
+    try {
+        ({ skills } = await session.rpc.skills.list());
+    } catch (err) {
+        debug(`skills.list failed before drafting: ${err?.message ?? err}`);
+    }
+    const root = skillsRootFrom(skills);
+
+    // An extend or refine of a skill self-learn cannot write — a repository's, a plugin's or a
+    // bundled one — would only fail at approval, after the user had read the draft. The lesson is
+    // still worth keeping, so it is drafted as a new personal skill instead, with the read-only
+    // skill shown for reference. A name the runtime does not report at all is left to fail below:
+    // that is a screener mistake, not a read-only skill.
+    let related = null;
+    if (verdict.target !== "new") {
+        const named =
+            skills.find((s) => s.name === verdict.skill && s.path) ??
+            skills.find((s) => s.name === verdict.skill);
+        if (named && !isInsideRoot(named.path, root)) {
+            try {
+                related = named.path ? readFileSync(named.path, "utf8") : null;
+            } catch (err) {
+                debug(`could not read read-only skill "${verdict.skill}": ${err?.message ?? err}`);
+            }
+            debug(`"${verdict.skill}" is read-only, so the ${verdict.target} is drafted as a new skill`);
+            verdict = {
+                ...verdict,
+                target: "new",
+                retargetedFrom: { skill: verdict.skill, target: verdict.target },
+            };
+        }
+    }
+
     const existing =
         verdict.target === "new"
             ? null
@@ -1049,7 +1104,17 @@ async function draft(session, verdict, transcript) {
         };
     }
 
-    let prompt = buildDrafterPrompt(verdict, transcript, existing);
+    // The drafter names a re-targeted skill, and a name already in use would turn the new skill
+    // into an overwrite of the user's own skill, or one shadowing a read-only skill.
+    const nameTaken = (name) => {
+        const lower = name.toLowerCase();
+        const listed = skills.some((s) => typeof s.name === "string" && s.name.toLowerCase() === lower);
+        return listed || existsSync(join(root, name))
+            ? `a skill named "${name}" already exists; choose a different name for this new skill`
+            : null;
+    };
+
+    let prompt = buildDrafterPrompt(verdict, transcript, existing ?? related);
 
     for (let attempt = 1; attempt <= DRAFT_ATTEMPTS; attempt++) {
         const raw = await runScreener(session, prompt, { label: "drafter" });
@@ -1057,7 +1122,10 @@ async function draft(session, verdict, transcript) {
 
         if (result.decline) return result;
 
-        const problem = result.error ?? validateProposal(result.proposal, cfg("maxSkillBytes"));
+        const problem =
+            result.error ??
+            validateProposal(result.proposal, cfg("maxSkillBytes")) ??
+            (verdict.retargetedFrom ? nameTaken(result.proposal.name) : null);
         if (!problem) {
             debug(`draft ready on attempt ${attempt}`);
             return result;
@@ -1120,9 +1188,11 @@ async function screenAndDraft(session, opts = {}) {
     // Parked rather than logged now: this runs after `session.idle`, where there is no live turn
     // for an extension log to render into. `onAgentStop` flushes it at the start of the next turn's
     // end, alongside the approval dialog it belongs with.
+    const retargeted = result.proposal.retargetedFrom;
     state.pendingAnnouncement =
-        `self-learn: drafted ${result.proposal.mode} "${result.proposal.name}" — ` +
-        `approve or decline it below`;
+        `self-learn: drafted ${result.proposal.mode} "${result.proposal.name}"` +
+        (retargeted ? ` (instead of ${retargeted.target === "refine" ? "refining" : "extending"} read-only "${retargeted.skill}")` : "") +
+        ` — approve or decline it below`;
     return verdict;
 }
 
@@ -1244,8 +1314,12 @@ take effect until you re-enable it.`
         // renders as `...\me.agents\...`, which reads as a path bug that is not there. A code span
         // suppresses escape processing, so the path shows exactly as it is on disk.
         const pathNote = `\n\nFile: \`${target.file}\``;
+        const retargetNote =
+            typeof p.retargetedFrom?.skill === "string"
+                ? `\n\nDrafted as a new personal skill because "${p.retargetedFrom.skill}" is read-only here.`
+                : "";
 
-        const message = `self-learn wants to ${where}.\n\n${lead}\
+        const message = `self-learn wants to ${where}.${retargetNote}\n\n${lead}\
 ${heading}${closeOpenFence(truncate(p.body, 800))}\
 ${filesNote}${backupNote}${pathNote}${disabledNote}\n\nWrite it?`;
 

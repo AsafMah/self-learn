@@ -227,6 +227,19 @@ reviewing or committing would mark them.
   path lies outside the root. Plugin and bundled skills live in caches and install directories that
   updates overwrite, and are never modified. Resolving a refine against the personal root instead
   would silently create a shadow copy competing with the real skill, so neither shortcut is safe.
+- **Skills outside the root are marked `[READ-ONLY]`** in the screener's inventory — a repository's
+  `.github/skills`, plugin and bundled skills — and the screener is told `extend` and `refine` are
+  for unmarked skills only. A verdict that targets one anyway is checked in code before drafting:
+  the lesson is drafted as a **new personal skill** instead, with the read-only skill shown to the
+  drafter for reference. The drafter names it, and a name any listed skill or an existing directory
+  under the root already uses is rejected and retried, so the new skill can neither overwrite the
+  user's own nor shadow the read-only one. The approval dialog says the lesson was re-targeted.
+- When `skillsRoot` is not configured, the root is derived **only from personal skills**: the
+  directory holding a `personal-agents` skill, else a `personal-copilot` one, else `~/.agents/skills`.
+  Project, plugin and custom skills never decide it — deriving from whichever skill was listed first
+  once made a repository's `.github/skills` the write root. The runtime has an experimental
+  skill-discovery RPC that reports a preferred creation directory; it is not used while it is
+  experimental.
 - Skill names must match `^[a-z0-9][a-z0-9-]{0,63}$`, which rejects `../`, `..\`, `/`, and `.`;
   the resolved directory is additionally checked to be inside the root.
 - A `refine` or `extend` naming a skill that does not exist is rejected, rather than silently
@@ -430,7 +443,7 @@ First match wins: `$COPILOT_SELF_LEARN_CONFIG`, `<cwd>/.github/self-learn.json`,
 | `autoScreen` | `false` | Also review automatically at every qualifying yield. Off by default. |
 | `screenOnTaskComplete` | `true` | Review when the agent calls the built-in `task_complete` tool. |
 | `minToolCalls` | `5` | Only used when `autoScreen` is on. |
-| `skillsRoot` | `null` | Skills directory. `null` derives it from the runtime's own skill paths. |
+| `skillsRoot` | `null` | Skills directory. `null` derives it from the runtime's personal skill paths (see Safety). |
 | `maxSkillBytes` | `65536` | Rejects oversized drafts. |
 | `screenerModel` | `gpt-5.6-terra` | Model for stage 1. Should differ from other extensions' models — see below. |
 | `agentType` | `explore` | Built-in agent type. Only `explore`, `task`, `general-purpose`, `rubber-duck`, `code-review`, `research`, `security-review` are dispatchable. **Do not use `rubber-duck`** — see below. |

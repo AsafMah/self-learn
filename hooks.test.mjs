@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { boot } from "./test-support/host.mjs";
 
@@ -143,6 +143,169 @@ test("without a stop hook or task reply, the event log is read by the owned task
     };
     await host.command("learn-now");
     assert.match(host.logs.at(-1), /failed: surprising \(event reply\)/);
+});
+
+const QUOTE = "the cache key ignored the lockfile hash";
+
+const passingVerdict = (target, skill) => JSON.stringify({
+    criteria: Object.fromEntries(["surprising", "expensive", "undiscoverable", "transferable", "uncovered"]
+        .map((name) => [name, { pass: true, why: "fixture", ...(name === "expensive" ? { quote: QUOTE } : {}) }])),
+    target, skill, rationale: "Cache keys must include the lockfile hash",
+});
+
+const draftReply = (over = {}) => JSON.stringify({
+    description: "When a restored dependency cache looks stale",
+    section: "Lockfile cache keys",
+    body: "Key the cache on the lockfile hash.",
+    ...over,
+});
+
+// Writes a SKILL.md under the host's home for a skill the runtime reports; `dirs` null means the
+// runtime reports no path, as it does for bundled skills.
+function installSkill(host, name, source, dirs) {
+    const entry = { name, description: `${name} guidance`, source, enabled: true };
+    if (dirs) {
+        const folder = join(host.root, ...dirs, name);
+        mkdirSync(folder, { recursive: true });
+        entry.path = join(folder, "SKILL.md");
+        writeFileSync(entry.path, `---\nname: ${name}\ndescription: ${name} guidance\n---\n\nExisting ${name} guidance.\n`);
+    }
+    host.skills.push(entry);
+    return entry;
+}
+
+const REPO_SKILLS = ["repo", ".github", "skills"];
+const AGENTS_SKILLS = [".agents", "skills"];
+
+// Answers the screener and then each drafter in start order, returning the prompts each was given.
+function scriptAgents(host, replies) {
+    const prompts = [];
+    host.onStartAgent = async (agentId, request) => {
+        prompts.push(request.prompt);
+        await host.stopSubagent(agentId, replies[prompts.length - 1]);
+    };
+    return prompts;
+}
+
+async function bootDrafting(t) {
+    const host = await bootScreening(t);
+    host.events.push({ type: "user.message", data: { content: `The build was stale because ${QUOTE}.` } });
+    return host;
+}
+
+const savedProposal = (host) =>
+    JSON.parse(readFileSync(join(host.root, "files", "self-learn-pending.json"), "utf8")).proposal;
+
+const mainStop = (host) => host.options.hooks.onAgentStop(
+    { sessionId: host.session.sessionId }, { sessionId: host.session.sessionId });
+
+test("the screener is told which skills it cannot change", async (t) => {
+    const host = await bootScreening(t);
+    installSkill(host, "repo-guide", "project", REPO_SKILLS);
+    installSkill(host, "plugin-guide", "plugin", ["plugin-cache", "skills"]);
+    installSkill(host, "my-guide", "personal-agents", AGENTS_SKILLS);
+    installSkill(host, "bundled-guide", "builtin", null);
+    const prompts = scriptAgents(host, [rejectingVerdict("fixture")]);
+    await host.command("learn-now");
+    for (const name of ["repo-guide", "plugin-guide", "bundled-guide"]) {
+        assert.match(prompts[0], new RegExp(`^- ${name} \\[READ-ONLY\\]: `, "m"));
+    }
+    assert.match(prompts[0], /^- my-guide: /m);
+});
+
+test("a new skill is written under the personal root even when a repository skill is listed first", async (t) => {
+    const host = await boot(t);
+    installSkill(host, "repo-guide", "project", REPO_SKILLS);
+    installSkill(host, "copilot-guide", "personal-copilot", [".copilot", "skills"]);
+    const propose = host.options.tools.find((tool) => tool.name === "propose_skill");
+    const result = await propose.handler(
+        { mode: "new", name: "fresh-lesson", description: "Fixture lesson", body: "Fixture body" }, {});
+    assert.match(result, /Approved and written/);
+    assert.ok(existsSync(join(host.root, ".copilot", "skills", "fresh-lesson", "SKILL.md")));
+    assert.equal(existsSync(join(host.root, ...REPO_SKILLS, "fresh-lesson")), false);
+});
+
+test("with no personal skill installed, new skills go to ~/.agents/skills rather than a repository", async (t) => {
+    const host = await boot(t);
+    installSkill(host, "repo-guide", "project", REPO_SKILLS);
+    const propose = host.options.tools.find((tool) => tool.name === "propose_skill");
+    const result = await propose.handler(
+        { mode: "new", name: "fresh-lesson", description: "Fixture lesson", body: "Fixture body" }, {});
+    assert.match(result, /Approved and written/);
+    assert.ok(existsSync(join(host.root, ...AGENTS_SKILLS, "fresh-lesson", "SKILL.md")));
+    assert.equal(existsSync(join(host.root, ...REPO_SKILLS, "fresh-lesson")), false);
+});
+
+test("an extend aimed at a read-only skill is drafted as a new personal skill the drafter names", async (t) => {
+    const host = await bootDrafting(t);
+    const repo = installSkill(host, "repo-guide", "project", REPO_SKILLS);
+    installSkill(host, "my-guide", "personal-agents", AGENTS_SKILLS);
+    const repoBefore = readFileSync(repo.path, "utf8");
+    const prompts = scriptAgents(host, [
+        passingVerdict("extend", "repo-guide"),
+        draftReply({ name: "repo-guide" }),
+        draftReply({ name: "lockfile-cache-keys" }),
+    ]);
+    await host.command("learn-now");
+
+    assert.equal(prompts.length, 3, host.logs.at(-1));
+    assert.match(prompts[1], /"repo-guide".*cannot be changed here/s);
+    assert.match(prompts[1], /NEW personal skill/);
+    assert.match(prompts[1], /Existing repo-guide guidance\./);
+    assert.match(prompts[1], /"name":/);
+    assert.match(prompts[2], /previous reply was rejected: a skill named "repo-guide" already exists/);
+
+    const proposal = savedProposal(host);
+    assert.equal(proposal.mode, "new");
+    assert.equal(proposal.name, "lockfile-cache-keys");
+    assert.deepEqual(proposal.retargetedFrom, { skill: "repo-guide", target: "extend" });
+
+    await mainStop(host);
+    assert.match(host.confirmations.at(-1), /create new skill "lockfile-cache-keys"/);
+    assert.match(host.confirmations.at(-1), /"repo-guide" is read-only/);
+    assert.ok(existsSync(join(host.root, ...AGENTS_SKILLS, "lockfile-cache-keys", "SKILL.md")));
+    assert.equal(readFileSync(repo.path, "utf8"), repoBefore);
+});
+
+test("a refine aimed at a bundled skill with no path is re-targeted as a correction", async (t) => {
+    const host = await bootDrafting(t);
+    installSkill(host, "bundled-guide", "builtin", null);
+    const prompts = scriptAgents(host, [
+        passingVerdict("refine", "bundled-guide"),
+        draftReply({ name: "bundled-guide-correction" }),
+    ]);
+    await host.command("learn-now");
+
+    assert.equal(prompts.length, 2, host.logs.at(-1));
+    assert.match(prompts[1], /stating the correction/);
+    const proposal = savedProposal(host);
+    assert.equal(proposal.mode, "new");
+    assert.equal(proposal.name, "bundled-guide-correction");
+    assert.deepEqual(proposal.retargetedFrom, { skill: "bundled-guide", target: "refine" });
+});
+
+test("an extend of the user's own skill still extends it in place", async (t) => {
+    const host = await bootDrafting(t);
+    installSkill(host, "repo-guide", "project", REPO_SKILLS);
+    installSkill(host, "my-guide", "personal-agents", AGENTS_SKILLS);
+    const prompts = scriptAgents(host, [passingVerdict("extend", "my-guide"), draftReply({ name: "ignored" })]);
+    await host.command("learn-now");
+
+    assert.equal(prompts.length, 2, host.logs.at(-1));
+    assert.match(prompts[1], /Add to the existing skill "my-guide"/);
+    const proposal = savedProposal(host);
+    assert.equal(proposal.mode, "extend");
+    assert.equal(proposal.name, "my-guide");
+    assert.equal(proposal.retargetedFrom, undefined);
+});
+
+test("an extend naming no installed skill is still refused rather than re-targeted", async (t) => {
+    const host = await bootDrafting(t);
+    installSkill(host, "my-guide", "personal-agents", AGENTS_SKILLS);
+    const prompts = scriptAgents(host, [passingVerdict("extend", "ghost-skill")]);
+    await host.command("learn-now");
+    assert.equal(prompts.length, 1);
+    assert.match(host.logs.at(-1), /could not draft it \("ghost-skill" could not be read/);
 });
 
 test("declined and unavailable control confirmations do not change settings", async (t) => {
